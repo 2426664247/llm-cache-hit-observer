@@ -22,6 +22,7 @@ def estimate_cache_hit(
     best_cached_tokens = 0
     matched_request_id = None
 
+    # Conservative policy: only reuse cache candidates from the same model.
     for history_item in history_requests:
         if history_item.get("model") != current_model:
             continue
@@ -30,6 +31,7 @@ def estimate_cache_hit(
         if not isinstance(units, list):
             continue
 
+        # Each history item can expose multiple persisted boundary units.
         for unit in units:
             if not isinstance(unit, list):
                 continue
@@ -37,6 +39,7 @@ def estimate_cache_hit(
                 continue
             unit_len = len(unit)
             if unit_len > best_cached_tokens:
+                # Use the longest matched prefix unit as the estimated cached span.
                 best_cached_tokens = unit_len
                 matched_request_id = history_item.get("request_id")
 

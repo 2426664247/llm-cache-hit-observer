@@ -222,6 +222,7 @@ def create_app(
             }
 
         try:
+            # Estimate against current in-memory history before forwarding upstream.
             history = recorder.history_snapshot()
             estimate = estimate_cache_hit(request_record, history)
             recorder.touch_request(estimate.get("matched_request_id"))
@@ -245,6 +246,7 @@ def create_app(
                     headers=forwarded_headers,
                 )
         except Exception as exc:
+            # Upstream failures are surfaced to client and also logged as a trace entry.
             usage_metrics = {
                 "actual_input_tokens": None,
                 "actual_cached_tokens": None,
@@ -299,6 +301,7 @@ def create_app(
         )
 
         try:
+            # Attach output-boundary units so the next request can match a longer prefix.
             request_record = recorder.attach_response_cache_units(request_record, response_json)
             recorder.append_jsonl(session_id, log_payload)
             recorder.append_history(request_record)

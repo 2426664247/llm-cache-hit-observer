@@ -18,6 +18,7 @@ def _stable_to_text(value: Any) -> str:
 
 
 def _snap_down(token_count: int, block_size: int) -> int:
+    # Align to provider-like cache granularity (default 64-token blocks).
     if block_size <= 1:
         return max(token_count, 0)
     if token_count < block_size:
@@ -176,6 +177,7 @@ class RequestRecorder:
     def _prune_history_locked(self, now_epoch: Optional[float] = None) -> None:
         now = self._now_epoch() if now_epoch is None else float(now_epoch)
 
+        # TTL-based forgetting: entries not reused within idle window are dropped.
         if self._cache_idle_ttl_seconds > 0:
             kept: List[Dict[str, Any]] = []
             for item in self._history:
@@ -189,6 +191,7 @@ class RequestRecorder:
             self._history = kept
 
         if len(self._history) > self._max_history_requests:
+            # Keep newest items only when hitting memory cap.
             self._history = self._history[-self._max_history_requests :]
 
     def _encode_prompt(self, messages: List[Dict[str, Any]], thinking_mode: str) -> str:
@@ -213,6 +216,7 @@ class RequestRecorder:
         prompt_text = self._encode_prompt(messages_for_encoding, thinking_mode=thinking_mode)
         token_ids = self._tokenizer.tokenize_text(prompt_text)
         snapped_prefix_len = _snap_down(len(token_ids), self._block_size)
+        # Request boundary unit: the aligned input prefix is persisted for future matching.
         request_prefix_tokens = token_ids[:snapped_prefix_len] if snapped_prefix_len > 0 else []
         units: List[List[int]] = [request_prefix_tokens] if request_prefix_tokens else []
 
@@ -257,6 +261,7 @@ class RequestRecorder:
             output_tokens = self._tokenizer.tokenize_text(output_prompt)
             snapped_len = _snap_down(len(output_tokens), self._block_size)
             if snapped_len > 0:
+                # Output boundary unit: include assistant turn, then align and persist.
                 output_unit = output_tokens[:snapped_len]
                 key = tuple(output_unit)
                 if key not in existing:
