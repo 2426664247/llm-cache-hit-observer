@@ -24,6 +24,7 @@
 - 接收 OpenAI 兼容 `POST /v1/chat/completions`。
 - 请求体原样转发到上游 API。
 - 响应体原样返回给客户端。
+- 可从普通 JSON 响应和 SSE 流式响应中读取 `usage` 字段。
 - 每个进程自动生成 `session_id`。
 - 每个请求自动生成递增 `request_id`（`req_0001`、`req_0002`...）。
 - 使用 DeepSeek tokenizer 统计本地输入 token 数。
@@ -115,10 +116,15 @@ python main.py \
 - `actual_input_tokens`
 - `actual_cached_tokens`
 - `actual_cache_hit_rate`
+- `usage_source`
 - `difference_tokens`
 - `status`
 
-说明：不会记录敏感请求头（如 `Authorization`）。
+说明：
+
+- `usage_source` 为 `json_usage` 时，表示命中信息来自普通 JSON 响应。
+- `usage_source` 为 `sse_usage` 时，表示命中信息来自 SSE 流式响应中的 `data:` 事件。
+- 不会记录敏感请求头（如 `Authorization`）。
 
 ### 目录结构
 
@@ -145,6 +151,7 @@ cache_hit_proxy/
 - 单进程单会话（session）。
 - 当前实现绑定 DeepSeek tokenizer 与编码规则。
 - 仅做前缀估算，不覆盖 provider 全部缓存内部策略。
+- 当前支持从 SSE 流式响应中提取 `usage` 用于观测，但代理本身仍会先缓冲完整上游响应，再返回给客户端。
 - 当 `usage` 缺少缓存字段时，状态为 `actual_cache_unknown`。
 
 ---
@@ -173,6 +180,7 @@ It is designed to:
 - Accepts OpenAI-compatible `POST /v1/chat/completions`.
 - Forwards request body to upstream without modification.
 - Returns upstream response body to client without modification.
+- Reads `usage` from both standard JSON responses and SSE streaming responses.
 - Auto-generates a `session_id` per process.
 - Auto-generates incremental `request_id` per request.
 - Uses DeepSeek tokenizer for local token counting.
@@ -264,10 +272,15 @@ To avoid unbounded growth:
 - `actual_input_tokens`
 - `actual_cached_tokens`
 - `actual_cache_hit_rate`
+- `usage_source`
 - `difference_tokens`
 - `status`
 
-Sensitive headers (e.g. `Authorization`) are not logged.
+Notes:
+
+- `usage_source = json_usage` means the cache metrics came from a standard JSON response.
+- `usage_source = sse_usage` means the cache metrics were extracted from SSE `data:` events.
+- Sensitive headers (e.g. `Authorization`) are not logged.
 
 ### V1 Limits
 
@@ -275,4 +288,5 @@ Sensitive headers (e.g. `Authorization`) are not logged.
 - Single process / single auto-generated session.
 - Current implementation is tied to DeepSeek tokenizer and encoding rules.
 - Prefix-based approximation only, not a full provider-side cache simulation.
+- SSE usage extraction is supported for observability, but the proxy still buffers the full upstream response before returning it to the client.
 - If cache fields are absent in usage, status is `actual_cache_unknown`.
