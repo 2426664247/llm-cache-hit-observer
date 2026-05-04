@@ -123,6 +123,9 @@ def print_summary(
     actual_cached_tokens = usage_metrics.get("actual_cached_tokens")
     if actual_cached_tokens is None:
         print("Actual cached tokens: unknown")
+        usage_source = usage_metrics.get("usage_source")
+        if usage_source:
+            print(f"Usage source: {usage_source}")
         print(f"Status: {usage_metrics.get('status')}")
         print()
         return
@@ -133,6 +136,9 @@ def print_summary(
         print("Actual cache hit rate: unknown")
     else:
         print(f"Actual cache hit rate: {actual_rate * 100:.1f}%")
+    usage_source = usage_metrics.get("usage_source")
+    if usage_source:
+        print(f"Usage source: {usage_source}")
     print(f"Difference: {usage_metrics.get('difference_tokens')}")
     print(f"Status: {usage_metrics.get('status')}")
     print()
@@ -159,6 +165,7 @@ def build_log_payload(
         "actual_input_tokens": usage_metrics.get("actual_input_tokens"),
         "actual_cached_tokens": usage_metrics.get("actual_cached_tokens"),
         "actual_cache_hit_rate": usage_metrics.get("actual_cache_hit_rate"),
+        "usage_source": usage_metrics.get("usage_source"),
         "difference_tokens": usage_metrics.get("difference_tokens"),
         "status": status_override or usage_metrics.get("status"),
     }
@@ -284,6 +291,8 @@ def create_app(
                 response_json=response_json,
                 estimated_cached_tokens=estimate["estimated_cached_tokens"],
                 local_input_tokens=request_record.get("local_input_tokens", 0),
+                response_body=response_body,
+                response_content_type=upstream.headers.get("content-type"),
             )
         except Exception:
             usage_metrics = {
