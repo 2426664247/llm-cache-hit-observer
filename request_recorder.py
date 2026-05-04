@@ -1,8 +1,10 @@
 import copy
+import hashlib
 import json
 import time
 from pathlib import Path
 from threading import Lock
+from statistics import median
 from typing import Any, Dict, List, Optional
 
 try:
@@ -15,6 +17,10 @@ def _stable_to_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def _snap_down(token_count: int, block_size: int) -> int:
@@ -170,6 +176,7 @@ class RequestRecorder:
         self._block_size = max(int(block_size), 1)
         self._cache_idle_ttl_seconds = max(float(cache_idle_ttl_hours), 0.0) * 3600.0
         self._max_history_requests = max(int(max_history_requests), 1)
+        self._openclaw_global_floor_by_model = self._load_openclaw_global_floor_by_model()
 
     def _now_epoch(self) -> float:
         return time.time()
@@ -200,12 +207,52 @@ class RequestRecorder:
         except Exception:
             return canonicalize_messages(messages)
 
+    def _load_openclaw_global_floor_by_model(self) -> Dict[str, int]:
+        # OpenClaw-only seed floor from historical traces, so first turn can
+        # approximate warm-cache behavior across sessions.
+        model_samples: Dict[str, List[int]] = {}
+        for path in self.traces_dir.glob("*.jsonl"):
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except Exception:
+                            continue
+                        if row.get("conversation_mode") != "openclaw_agent":
+                            continue
+                        if row.get("input_token_source") != "openclaw_raw_body":
+                            continue
+                        model = row.get("model")
+                        if not isinstance(model, str) or not model:
+                            continue
+                        cached = row.get("actual_cached_tokens")
+                        if not isinstance(cached, int) or cached <= 0:
+                            continue
+                        model_samples.setdefault(model, []).append(cached)
+            except Exception:
+                continue
+
+        floors: Dict[str, int] = {}
+        for model, samples in model_samples.items():
+            if not samples:
+                continue
+            m = int(median(samples))
+            m = _snap_down(m, self._block_size)
+            if m > 0:
+                floors[model] = m
+        return floors
+
     def create_request_record(
         self,
         session_id: str,
         request_id: str,
         timestamp: str,
         request_body: Any,
+        request_body_bytes: Optional[bytes] = None,
     ) -> Dict[str, Any]:
         body = request_body if isinstance(request_body, dict) else {}
         messages = body.get("messages", [])
@@ -215,6 +262,22 @@ class RequestRecorder:
         messages_for_encoding = _normalize_messages_for_v4(messages)
         prompt_text = self._encode_prompt(messages_for_encoding, thinking_mode=thinking_mode)
         token_ids = self._tokenizer.tokenize_text(prompt_text)
+        raw_body_sha256: Optional[str] = None
+        raw_body_size_bytes = 0
+        raw_body_token_count: Optional[int] = None
+        raw_body_token_ids: List[int] = []
+        if isinstance(request_body_bytes, (bytes, bytearray)):
+            raw_bytes = bytes(request_body_bytes)
+            raw_body_size_bytes = len(raw_bytes)
+            raw_body_sha256 = _sha256_hex(raw_bytes)
+            try:
+                raw_body_text = raw_bytes.decode("utf-8", errors="replace")
+                raw_body_token_ids = self._tokenizer.tokenize_text(raw_body_text)
+                raw_body_token_count = len(raw_body_token_ids)
+            except Exception:
+                raw_body_token_count = None
+                raw_body_token_ids = []
+
         snapped_prefix_len = _snap_down(len(token_ids), self._block_size)
         # Request boundary unit: the aligned input prefix is persisted for future matching.
         request_prefix_tokens = token_ids[:snapped_prefix_len] if snapped_prefix_len > 0 else []
@@ -229,17 +292,67 @@ class RequestRecorder:
             "canonical_text": canonical_text,
             "token_ids": token_ids,
             "local_input_tokens": len(token_ids),
+            "raw_request_body_sha256": raw_body_sha256,
+            "raw_request_body_size_bytes": raw_body_size_bytes,
+            "raw_request_body_tokenizer_tokens": raw_body_token_count,
+            "raw_request_body_token_ids": raw_body_token_ids,
             "persisted_prefix_units_tokens": units,
             "cache_block_size": self._block_size,
+            "cache_estimation_input_tokens": len(token_ids),
+            "_openclaw_global_floor_tokens": self._openclaw_global_floor_by_model.get(
+                str(body.get("model", "")),
+                0,
+            ),
+            "_cache_unit_source": "deepseek_prompt_encoding",
+            "_cache_unit_fallback_reason": None,
             "_thinking_mode": thinking_mode,
             "_messages_for_encoding": messages_for_encoding,
         }
+
+    def apply_input_token_source(
+        self,
+        request_record: Dict[str, Any],
+        input_token_source: str,
+    ) -> Dict[str, Any]:
+        if input_token_source != "openclaw_raw_body":
+            request_record["_cache_unit_source"] = "deepseek_prompt_encoding"
+            request_record["_cache_unit_fallback_reason"] = None
+            return request_record
+
+        raw_ids = request_record.get("raw_request_body_token_ids")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            request_record["_cache_unit_source"] = "deepseek_prompt_encoding"
+            request_record["_cache_unit_fallback_reason"] = "raw_request_body_unavailable"
+            return request_record
+
+        block_size = request_record.get("cache_block_size", self._block_size)
+        try:
+            block_size_i = max(int(block_size), 1)
+        except Exception:
+            block_size_i = self._block_size
+
+        snapped_prefix_len = _snap_down(len(raw_ids), block_size_i)
+        request_prefix_tokens = raw_ids[:snapped_prefix_len] if snapped_prefix_len > 0 else []
+
+        # Switch cache-estimation basis to raw request body token stream.
+        request_record["token_ids"] = raw_ids
+        request_record["persisted_prefix_units_tokens"] = (
+            [request_prefix_tokens] if request_prefix_tokens else []
+        )
+        request_record["cache_estimation_input_tokens"] = len(raw_ids)
+        request_record["_cache_unit_source"] = "raw_request_body"
+        request_record["_cache_unit_fallback_reason"] = None
+        return request_record
 
     def attach_response_cache_units(
         self,
         request_record: Dict[str, Any],
         response_json: Any,
     ) -> Dict[str, Any]:
+        if request_record.get("_cache_unit_source") == "raw_request_body":
+            # Keep unit space consistent: raw-body mode only persists request-boundary units.
+            return request_record
+
         # DeepSeek conservative baseline:
         # keep request boundary + output boundary, but do not add shared-prefix / interval units.
         units = request_record.get("persisted_prefix_units_tokens")
