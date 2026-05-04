@@ -44,10 +44,14 @@ python main.py \
   --tokenizer-dir ./deepseek_tokenizer \
   --block-size 64 \
   --cache-idle-ttl-hours 24 \
-  --max-history-requests 2000 \
   --conversation-mode openclaw_agent \
   --raw-request-capture none
 ```
+
+By default, in-memory cache history is unlimited by request count and is
+pruned only by idle TTL (`--cache-idle-ttl-hours`, default 24 hours). Set
+`--max-history-requests` to a positive number only when you want a manual
+memory safety cap.
 
 ## Run (simple streaming mode)
 
@@ -86,6 +90,8 @@ python main.py \
 - `raw_request_body_truncated`
 - `estimated_cached_tokens`
 - `actual_cached_tokens`
+- `actual_uncached_tokens`
+- `cache_estimation_diff_threshold_tokens`
 - `estimation_denominator_tokens`
 - `cache_unit_source`
 - `cache_unit_fallback_reason`
@@ -98,6 +104,12 @@ Trace file path:
 
 ## Notes
 
+- `difference_tokens` is `actual_cached_tokens - estimated_cached_tokens`.
+- `status` flags `overestimated` when `difference_tokens < -1280`; otherwise it is
+  `normal` when actual usage is available. This catches cases where the proxy expected
+  cache reuse but the upstream service returned much less cached context.
+- `actual_uncached_tokens` is recorded as diagnostic context only; it does not drive
+  anomaly status because prompt growth or topic shifts can legitimately add uncached input.
 - `raw-stream` in OpenClaw is output-stream oriented; it is not a request-payload logger.
 - `cacheTrace stream:context` is useful context snapshot, but not guaranteed to be final HTTP request body.
 - If you need byte-level replay of raw requests, run with `--raw-request-capture base64`.

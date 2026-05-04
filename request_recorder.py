@@ -166,7 +166,7 @@ class RequestRecorder:
         tokenizer_dir: str,
         block_size: int = 64,
         cache_idle_ttl_hours: float = 24.0,
-        max_history_requests: int = 2000,
+        max_history_requests: int = 0,
     ) -> None:
         self.traces_dir = Path(traces_dir)
         self.traces_dir.mkdir(parents=True, exist_ok=True)
@@ -175,7 +175,10 @@ class RequestRecorder:
         self._lock = Lock()
         self._block_size = max(int(block_size), 1)
         self._cache_idle_ttl_seconds = max(float(cache_idle_ttl_hours), 0.0) * 3600.0
-        self._max_history_requests = max(int(max_history_requests), 1)
+        try:
+            self._max_history_requests = int(max_history_requests)
+        except Exception:
+            self._max_history_requests = 0
         self._openclaw_global_floor_by_model = self._load_openclaw_global_floor_by_model()
 
     def _now_epoch(self) -> float:
@@ -197,7 +200,7 @@ class RequestRecorder:
                     kept.append(item)
             self._history = kept
 
-        if len(self._history) > self._max_history_requests:
+        if self._max_history_requests > 0 and len(self._history) > self._max_history_requests:
             # Keep newest items only when hitting memory cap.
             self._history = self._history[-self._max_history_requests :]
 

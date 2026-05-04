@@ -56,8 +56,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-history-requests",
         type=int,
-        default=2000,
-        help="Hard cap for in-memory history size (default: 2000)",
+        default=0,
+        help="Hard cap for in-memory history size; 0 means unlimited / TTL only (default: 0)",
     )
     parser.add_argument(
         "--conversation-mode",
@@ -187,6 +187,9 @@ def print_summary(
     usage_source = usage_metrics.get("usage_source")
     if usage_source:
         print(f"Usage source: {usage_source}")
+    actual_uncached_tokens = usage_metrics.get("actual_uncached_tokens")
+    if actual_uncached_tokens is not None:
+        print(f"Actual uncached tokens: {actual_uncached_tokens}")
     print(f"Difference: {usage_metrics.get('difference_tokens')}")
     print(f"Status: {usage_metrics.get('status')}")
     print()
@@ -241,6 +244,10 @@ def build_log_payload(
         "actual_input_tokens": usage_metrics.get("actual_input_tokens"),
         "actual_cached_tokens": usage_metrics.get("actual_cached_tokens"),
         "actual_cache_hit_rate": usage_metrics.get("actual_cache_hit_rate"),
+        "actual_uncached_tokens": usage_metrics.get("actual_uncached_tokens"),
+        "cache_estimation_diff_threshold_tokens": usage_metrics.get(
+            "cache_estimation_diff_threshold_tokens"
+        ),
         "usage_source": usage_metrics.get("usage_source"),
         "difference_tokens": usage_metrics.get("difference_tokens"),
         "status": status_override or usage_metrics.get("status"),
@@ -509,7 +516,10 @@ def main() -> None:
     print(f"Tokenizer dir: {tokenizer_path}")
     print(f"Block size: {args.block_size}")
     print(f"Cache idle TTL (hours): {args.cache_idle_ttl_hours}")
-    print(f"Max history requests: {args.max_history_requests}")
+    if args.max_history_requests > 0:
+        print(f"Max history requests: {args.max_history_requests}")
+    else:
+        print("Max history requests: unlimited (TTL only)")
     print(f"Conversation mode: {args.conversation_mode}")
     print(f"Input token source: {args.input_token_source}")
     print(f"Raw request capture: {args.raw_request_capture}")
