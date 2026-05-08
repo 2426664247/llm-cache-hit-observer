@@ -61,6 +61,34 @@ def _extract_thinking_mode(request_body: Dict[str, Any]) -> str:
     return "chat"
 
 
+def _extract_reasoning_effort(request_body: Dict[str, Any]) -> Optional[str]:
+    value = request_body.get("reasoning_effort")
+    if not isinstance(value, str):
+        return None
+
+    normalized = value.strip().lower()
+    if normalized in {"high", "max"}:
+        return normalized
+    return None
+
+
+def _extract_text_from_content_blocks(content: Any) -> Optional[str]:
+    if not isinstance(content, list):
+        return None
+
+    text_parts: List[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if str(block.get("type", "")).strip().lower() != "text":
+            continue
+        text_parts.append(str(block.get("text", "")))
+
+    if not text_parts:
+        return None
+    return "\n\n".join(text_parts)
+
+
 def _normalize_messages_for_v4(messages: Any) -> List[Dict[str, Any]]:
     if not isinstance(messages, list):
         return [{"role": "user", "content": _stable_to_text(messages)}]
@@ -100,6 +128,47 @@ def _normalize_messages_for_v4(messages: Any) -> List[Dict[str, Any]]:
 
         normalized.append(msg)
 
+    return normalized
+
+
+def _normalize_messages_for_piai_probe(
+    messages: Any,
+    top_level_tools: Any,
+) -> List[Dict[str, Any]]:
+    if not isinstance(messages, list):
+        normalized = _normalize_messages_for_v4(messages)
+    else:
+        rewritten_messages: List[Any] = []
+        for item in messages:
+            if not isinstance(item, dict):
+                rewritten_messages.append(item)
+                continue
+
+            item_copy = copy.deepcopy(item)
+            extracted_text = _extract_text_from_content_blocks(item_copy.get("content"))
+            if extracted_text is not None:
+                item_copy["content"] = extracted_text
+            rewritten_messages.append(item_copy)
+        normalized = _normalize_messages_for_v4(rewritten_messages)
+
+    if not isinstance(top_level_tools, list) or not top_level_tools:
+        return normalized
+
+    tools_copy = copy.deepcopy(top_level_tools)
+    for msg in normalized:
+        role = str(msg.get("role", "")).strip().lower()
+        if role in {"system", "developer"}:
+            msg["tools"] = tools_copy
+            return normalized
+
+    normalized.insert(
+        0,
+        {
+            "role": "system",
+            "content": "",
+            "tools": tools_copy,
+        },
+    )
     return normalized
 
 
@@ -204,9 +273,18 @@ class RequestRecorder:
             # Keep newest items only when hitting memory cap.
             self._history = self._history[-self._max_history_requests :]
 
-    def _encode_prompt(self, messages: List[Dict[str, Any]], thinking_mode: str) -> str:
+    def _encode_prompt(
+        self,
+        messages: List[Dict[str, Any]],
+        thinking_mode: str,
+        reasoning_effort: Optional[str] = None,
+    ) -> str:
         try:
-            return encode_messages(messages, thinking_mode=thinking_mode)
+            return encode_messages(
+                messages,
+                thinking_mode=thinking_mode,
+                reasoning_effort=reasoning_effort,
+            )
         except Exception:
             return canonicalize_messages(messages)
 
@@ -256,14 +334,28 @@ class RequestRecorder:
         timestamp: str,
         request_body: Any,
         request_body_bytes: Optional[bytes] = None,
+        conversation_mode: str = "simple_streaming",
     ) -> Dict[str, Any]:
         body = request_body if isinstance(request_body, dict) else {}
         messages = body.get("messages", [])
         canonical_text = canonicalize_messages(messages)
 
         thinking_mode = _extract_thinking_mode(body)
-        messages_for_encoding = _normalize_messages_for_v4(messages)
-        prompt_text = self._encode_prompt(messages_for_encoding, thinking_mode=thinking_mode)
+        reasoning_effort: Optional[str] = None
+        if conversation_mode == "piai_probe":
+            messages_for_encoding = _normalize_messages_for_piai_probe(
+                messages=messages,
+                top_level_tools=body.get("tools"),
+            )
+            reasoning_effort = _extract_reasoning_effort(body)
+        else:
+            messages_for_encoding = _normalize_messages_for_v4(messages)
+
+        prompt_text = self._encode_prompt(
+            messages_for_encoding,
+            thinking_mode=thinking_mode,
+            reasoning_effort=reasoning_effort,
+        )
         token_ids = self._tokenizer.tokenize_text(prompt_text)
         raw_body_sha256: Optional[str] = None
         raw_body_size_bytes = 0
@@ -309,6 +401,7 @@ class RequestRecorder:
             "_cache_unit_source": "deepseek_prompt_encoding",
             "_cache_unit_fallback_reason": None,
             "_thinking_mode": thinking_mode,
+            "_reasoning_effort": reasoning_effort,
             "_messages_for_encoding": messages_for_encoding,
         }
 
@@ -367,13 +460,20 @@ class RequestRecorder:
         assistant_message = _extract_assistant_message_from_response(response_json)
         if assistant_message:
             thinking_mode = str(request_record.get("_thinking_mode", "chat"))
+            reasoning_effort = request_record.get("_reasoning_effort")
+            if not isinstance(reasoning_effort, str):
+                reasoning_effort = None
             base_messages = request_record.get("_messages_for_encoding")
             if not isinstance(base_messages, list):
                 base_messages = _normalize_messages_for_v4(request_record.get("messages", []))
 
             output_messages = copy.deepcopy(base_messages)
             output_messages.append(assistant_message)
-            output_prompt = self._encode_prompt(output_messages, thinking_mode=thinking_mode)
+            output_prompt = self._encode_prompt(
+                output_messages,
+                thinking_mode=thinking_mode,
+                reasoning_effort=reasoning_effort,
+            )
             output_tokens = self._tokenizer.tokenize_text(output_prompt)
             snapped_len = _snap_down(len(output_tokens), self._block_size)
             if snapped_len > 0:

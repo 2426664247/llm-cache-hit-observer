@@ -12,6 +12,12 @@ from fastapi.responses import JSONResponse
 from cache_estimator import estimate_cache_hit
 from request_recorder import RequestRecorder
 from usage_reader import read_actual_usage
+from vllm_metrics import (
+    VLLM_PROBE_BLOCK_SIZE,
+    compute_vllm_metrics_delta,
+    parse_vllm_metrics_text,
+    read_actual_usage_from_vllm_metrics,
+)
 
 
 HOP_BY_HOP_HEADERS = {
@@ -32,8 +38,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-base-url",
         type=str,
-        required=True,
+        default=None,
         help="Target model API base URL, e.g. https://api.deepseek.com",
+    )
+    parser.add_argument(
+        "--target-chat-url",
+        type=str,
+        default=None,
+        help=(
+            "Full upstream chat/completions URL. Overrides --target-base-url, "
+            "useful for OpenAI-compatible providers whose endpoint is not /v1."
+        ),
     )
     parser.add_argument(
         "--tokenizer-dir",
@@ -44,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--block-size",
         type=int,
-        default=64,
+        default=None,
         help="Cache storage unit size for estimation (default: 64)",
     )
     parser.add_argument(
@@ -63,11 +78,22 @@ def parse_args() -> argparse.Namespace:
         "--conversation-mode",
         type=str,
         default="simple_streaming",
-        choices=["simple_streaming", "openclaw_agent"],
+        choices=["simple_streaming", "openclaw_agent", "piai_probe", "vllm_probe"],
         help=(
             "Conversation mode preset. "
             "simple_streaming matches legacy direct chat behavior (v1 defaults); "
-            "openclaw_agent matches OpenClaw agent behavior (v2 defaults)."
+            "openclaw_agent matches OpenClaw agent behavior (v2 defaults); "
+            "piai_probe matches pi-ai final payload prompt encoding; "
+            "vllm_probe uses vLLM metrics for actual cache hits."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-metrics-url",
+        type=str,
+        default=None,
+        help=(
+            "vLLM Prometheus metrics URL for vllm_probe mode. "
+            "Defaults to TARGET_BASE_URL without /v1 plus /metrics."
         ),
     )
     parser.add_argument(
@@ -83,9 +109,27 @@ def parse_args() -> argparse.Namespace:
         default=12000,
         help="Max characters for utf8 raw request capture (default: 12000)",
     )
+    parser.add_argument(
+        "--session-id",
+        type=str,
+        default=None,
+        help="Optional trace session id override for reproducible experiment runs",
+    )
     args = parser.parse_args()
 
-    if args.conversation_mode == "simple_streaming":
+    if not args.target_base_url and not args.target_chat_url:
+        parser.error("one of --target-base-url or --target-chat-url is required")
+
+    if args.conversation_mode == "vllm_probe":
+        if args.block_size is not None and args.block_size != VLLM_PROBE_BLOCK_SIZE:
+            parser.error(f"vllm_probe requires --block-size {VLLM_PROBE_BLOCK_SIZE}")
+        args.block_size = VLLM_PROBE_BLOCK_SIZE
+        if not args.vllm_metrics_url and not args.target_base_url:
+            parser.error("vllm_probe requires --vllm-metrics-url when --target-base-url is absent")
+    elif args.block_size is None:
+        args.block_size = 64
+
+    if args.conversation_mode in {"simple_streaming", "piai_probe", "vllm_probe"}:
         args.input_token_source = "deepseek_prompt_encoding"
     else:
         args.input_token_source = "openclaw_raw_body"
@@ -108,6 +152,33 @@ def build_target_chat_url(target_base_url: str) -> str:
     return f"{base}/v1/chat/completions"
 
 
+def resolve_target_chat_url(
+    target_base_url: str | None,
+    target_chat_url: str | None,
+) -> str:
+    if target_chat_url:
+        return target_chat_url.rstrip("/")
+    if not target_base_url:
+        raise ValueError("target_base_url is required when target_chat_url is not set")
+    return build_target_chat_url(target_base_url)
+
+
+def resolve_vllm_metrics_url(
+    target_base_url: str | None,
+    target_chat_url: str | None,
+    vllm_metrics_url: str | None,
+) -> str | None:
+    if vllm_metrics_url:
+        return vllm_metrics_url.rstrip("/")
+    if not target_base_url:
+        return None
+
+    base = target_base_url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    return f"{base}/metrics"
+
+
 def filter_request_headers(headers: Dict[str, str]) -> Dict[str, str]:
     forwarded: Dict[str, str] = {}
     for key, value in headers.items():
@@ -122,7 +193,7 @@ def filter_response_headers(headers: Dict[str, str]) -> Dict[str, str]:
     filtered: Dict[str, str] = {}
     for key, value in headers.items():
         k = key.lower()
-        if k in HOP_BY_HOP_HEADERS or k == "content-length":
+        if k in HOP_BY_HOP_HEADERS or k in {"content-length", "content-encoding"}:
             continue
         filtered[key] = value
     return filtered
@@ -206,6 +277,7 @@ def build_log_payload(
     raw_request_utf8: str | None,
     raw_request_base64: str | None,
     raw_request_truncated: bool,
+    vllm_metrics_details: Dict[str, Any] | None = None,
     status_override: str | None = None,
 ) -> Dict[str, Any]:
     actual_input_tokens = usage_metrics.get("actual_input_tokens")
@@ -230,6 +302,7 @@ def build_log_payload(
         "raw_request_body_tokenizer_tokens": request_record.get("raw_request_body_tokenizer_tokens"),
         "cache_unit_source": request_record.get("_cache_unit_source"),
         "cache_unit_fallback_reason": request_record.get("_cache_unit_fallback_reason"),
+        "cache_block_size": request_record.get("cache_block_size"),
         "raw_request_capture_mode": raw_request_capture_mode,
         "raw_request_body_utf8": raw_request_utf8,
         "raw_request_body_base64": raw_request_base64,
@@ -252,11 +325,27 @@ def build_log_payload(
         "difference_tokens": usage_metrics.get("difference_tokens"),
         "status": status_override or usage_metrics.get("status"),
     }
+    if vllm_metrics_details is not None:
+        payload.update(vllm_metrics_details)
     return payload
 
 
+async def fetch_vllm_metrics_snapshot(
+    client: httpx.AsyncClient,
+    metrics_url: str,
+) -> tuple[Dict[str, float] | None, str | None]:
+    try:
+        response = await client.get(metrics_url)
+        response.raise_for_status()
+        return parse_vllm_metrics_text(response.text), None
+    except Exception as exc:
+        return None, str(exc)
+
+
 def create_app(
-    target_base_url: str,
+    target_base_url: str | None,
+    target_chat_url: str | None,
+    vllm_metrics_url: str | None,
     session_id: str,
     tokenizer_dir: str,
     block_size: int,
@@ -276,7 +365,12 @@ def create_app(
         cache_idle_ttl_hours=cache_idle_ttl_hours,
         max_history_requests=max_history_requests,
     )
-    chat_url = build_target_chat_url(target_base_url)
+    chat_url = resolve_target_chat_url(target_base_url, target_chat_url)
+    resolved_vllm_metrics_url = resolve_vllm_metrics_url(
+        target_base_url=target_base_url,
+        target_chat_url=target_chat_url,
+        vllm_metrics_url=vllm_metrics_url,
+    )
 
     app.state.request_counter = 0
     app.state.session_id = session_id
@@ -316,6 +410,7 @@ def create_app(
                 timestamp=timestamp,
                 request_body=request_json,
                 request_body_bytes=body_bytes,
+                conversation_mode=conversation_mode,
             )
             request_record = recorder.apply_input_token_source(
                 request_record=request_record,
@@ -367,14 +462,32 @@ def create_app(
         forwarded_headers = filter_request_headers(dict(request.headers))
         query = request.url.query
         target_url = f"{chat_url}?{query}" if query else chat_url
+        vllm_metrics_details: Dict[str, Any] | None = None
+        before_vllm_metrics: Dict[str, float] | None = None
+        before_vllm_metrics_error: str | None = None
 
         try:
             async with httpx.AsyncClient(timeout=300.0) as client:
+                if conversation_mode == "vllm_probe" and resolved_vllm_metrics_url:
+                    before_vllm_metrics, before_vllm_metrics_error = (
+                        await fetch_vllm_metrics_snapshot(client, resolved_vllm_metrics_url)
+                    )
                 upstream = await client.post(
                     target_url,
                     content=body_bytes,
                     headers=forwarded_headers,
                 )
+                if conversation_mode == "vllm_probe" and resolved_vllm_metrics_url:
+                    after_vllm_metrics, after_vllm_metrics_error = (
+                        await fetch_vllm_metrics_snapshot(client, resolved_vllm_metrics_url)
+                    )
+                    metrics_error = before_vllm_metrics_error or after_vllm_metrics_error
+                    vllm_metrics_details = compute_vllm_metrics_delta(
+                        before=before_vllm_metrics,
+                        after=after_vllm_metrics,
+                        existing_error=metrics_error,
+                    )
+                    vllm_metrics_details["vllm_metrics_url"] = resolved_vllm_metrics_url
         except Exception as exc:
             # Upstream failures are surfaced to client and also logged as a trace entry.
             usage_metrics = {
@@ -384,6 +497,13 @@ def create_app(
                 "difference_tokens": None,
                 "status": "upstream_error",
             }
+            if conversation_mode == "vllm_probe":
+                vllm_metrics_details = compute_vllm_metrics_delta(
+                    before=before_vllm_metrics,
+                    after=None,
+                    existing_error=before_vllm_metrics_error or "upstream_error",
+                )
+                vllm_metrics_details["vllm_metrics_url"] = resolved_vllm_metrics_url
             log_payload = build_log_payload(
                 request_record=request_record,
                 estimate=estimate,
@@ -395,6 +515,7 @@ def create_app(
                 raw_request_utf8=raw_request_utf8,
                 raw_request_base64=raw_request_base64,
                 raw_request_truncated=raw_request_truncated,
+                vllm_metrics_details=vllm_metrics_details,
                 status_override="upstream_error",
             )
             try:
@@ -425,22 +546,47 @@ def create_app(
         except Exception:
             response_json = {}
 
-        try:
-            usage_metrics = read_actual_usage(
-                response_json=response_json,
-                estimated_cached_tokens=estimate["estimated_cached_tokens"],
-                local_input_tokens=predicted_input_tokens,
-                response_body=response_body,
-                response_content_type=upstream.headers.get("content-type"),
-            )
-        except Exception:
-            usage_metrics = {
-                "actual_input_tokens": None,
-                "actual_cached_tokens": None,
-                "actual_cache_hit_rate": None,
-                "difference_tokens": None,
-                "status": "actual_cache_unknown",
-            }
+        if conversation_mode == "vllm_probe":
+            if vllm_metrics_details is None:
+                vllm_metrics_details = compute_vllm_metrics_delta(
+                    before=None,
+                    after=None,
+                    existing_error="metrics_not_collected",
+                )
+                vllm_metrics_details["vllm_metrics_url"] = resolved_vllm_metrics_url
+            try:
+                usage_metrics = read_actual_usage_from_vllm_metrics(
+                    response_json=response_json,
+                    estimated_cached_tokens=estimate["estimated_cached_tokens"],
+                    local_input_tokens=predicted_input_tokens,
+                    metrics_delta=vllm_metrics_details,
+                )
+            except Exception:
+                usage_metrics = {
+                    "actual_input_tokens": None,
+                    "actual_cached_tokens": None,
+                    "actual_cache_hit_rate": None,
+                    "difference_tokens": None,
+                    "status": "actual_cache_unknown",
+                    "usage_source": "vllm_metrics_delta",
+                }
+        else:
+            try:
+                usage_metrics = read_actual_usage(
+                    response_json=response_json,
+                    estimated_cached_tokens=estimate["estimated_cached_tokens"],
+                    local_input_tokens=predicted_input_tokens,
+                    response_body=response_body,
+                    response_content_type=upstream.headers.get("content-type"),
+                )
+            except Exception:
+                usage_metrics = {
+                    "actual_input_tokens": None,
+                    "actual_cached_tokens": None,
+                    "actual_cache_hit_rate": None,
+                    "difference_tokens": None,
+                    "status": "actual_cache_unknown",
+                }
 
         actual_cached_for_history = usage_metrics.get("actual_cached_tokens")
         if isinstance(actual_cached_for_history, int) and actual_cached_for_history >= 0:
@@ -459,6 +605,7 @@ def create_app(
             raw_request_utf8=raw_request_utf8,
             raw_request_base64=raw_request_base64,
             raw_request_truncated=raw_request_truncated,
+            vllm_metrics_details=vllm_metrics_details,
         )
 
         try:
@@ -498,9 +645,11 @@ def main() -> None:
             "Please download DeepSeek tokenizer files first."
         )
 
-    session_id = make_session_id()
+    session_id = args.session_id or make_session_id()
     app = create_app(
         args.target_base_url,
+        args.target_chat_url,
+        args.vllm_metrics_url,
         session_id,
         tokenizer_dir=str(tokenizer_path),
         block_size=args.block_size,
@@ -513,6 +662,14 @@ def main() -> None:
     )
     print(f"Session ID: {session_id}")
     print(f"Target base URL: {args.target_base_url}")
+    print(f"Target chat URL: {resolve_target_chat_url(args.target_base_url, args.target_chat_url)}")
+    resolved_vllm_metrics_url = resolve_vllm_metrics_url(
+        args.target_base_url,
+        args.target_chat_url,
+        args.vllm_metrics_url,
+    )
+    if args.conversation_mode == "vllm_probe":
+        print(f"vLLM metrics URL: {resolved_vllm_metrics_url}")
     print(f"Tokenizer dir: {tokenizer_path}")
     print(f"Block size: {args.block_size}")
     print(f"Cache idle TTL (hours): {args.cache_idle_ttl_hours}")

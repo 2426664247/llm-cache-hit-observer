@@ -33,6 +33,7 @@ def _extract_cached_tokens(usage: Dict[str, Any]) -> Optional[int]:
         usage.get("cached_tokens"),
         usage.get("prompt_cache_hit_tokens"),
         usage.get("cache_hit_tokens"),
+        usage.get("cacheRead"),
         usage.get("input_cached_tokens"),
     ]
     cached_tokens = _pick_first_int(direct_candidates)
@@ -41,7 +42,21 @@ def _extract_cached_tokens(usage: Dict[str, Any]) -> Optional[int]:
 
     details = usage.get("prompt_tokens_details")
     if isinstance(details, dict):
-        return _as_int(details.get("cached_tokens"))
+        cached_candidates = [
+            details.get("cached_tokens"),
+            details.get("cacheRead"),
+        ]
+        cache_write_tokens = _pick_first_int(
+            [
+                details.get("cache_write_tokens"),
+                details.get("cacheWrite"),
+            ]
+        ) or 0
+        cached_tokens = _pick_first_int(cached_candidates)
+        if cached_tokens is not None:
+            if cache_write_tokens > 0 and cached_tokens >= cache_write_tokens:
+                return cached_tokens - cache_write_tokens
+            return cached_tokens
     return None
 
 
