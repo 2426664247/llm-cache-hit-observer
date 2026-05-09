@@ -42,9 +42,26 @@ cd cache_hit_proxy
 pip install -r requirements.txt
 ```
 
-## Tokenizer files
+## Tokenizer presets
 
-Current implementation requires local DeepSeek tokenizer files in `./deepseek_tokenizer`.
+Prompt-token estimation runs locally. Pick a tokenizer with `--tokenizer-preset`:
+
+- `deepseek-v4-pro` uses the bundled DeepSeek tokenizer and renderer.
+- `glm-5.1` uses the local GLM tokenizer and official chat template.
+- `qwen3-coder-plus` uses the local Qwen3-Coder tokenizer and official chat template.
+- `kimi-k2.6` uses the local Kimi tokenizer and official chat template.
+- `doubao-seed-2-0-code-preview-260215` and `volcanoengine` fall back to the DeepSeek tokenizer so local estimation still works, with expected drift.
+
+DeepSeek and Doubao fallback use `./deepseek_tokenizer`. HF chat-template presets default to `./tokenizers/<preset>`. Override with `--tokenizer-dir` when needed.
+
+Download or check tokenizer-only files:
+
+```bash
+python download_tokenizers.py
+python download_tokenizers.py --check-only
+```
+
+The downloader only requests tokenizer/template assets and ignores model weights.
 
 ## Run (OpenClaw agent mode)
 
@@ -52,7 +69,7 @@ Current implementation requires local DeepSeek tokenizer files in `./deepseek_to
 python main.py \
   --port 8787 \
   --target-base-url https://api.deepseek.com \
-  --tokenizer-dir ./deepseek_tokenizer \
+  --tokenizer-preset deepseek-v4-pro \
   --block-size 64 \
   --cache-idle-ttl-hours 24 \
   --conversation-mode openclaw_agent \
@@ -70,7 +87,17 @@ memory safety cap.
 python main.py \
   --port 8787 \
   --target-base-url https://api.deepseek.com \
-  --tokenizer-dir ./deepseek_tokenizer \
+  --tokenizer-preset deepseek-v4-pro \
+  --conversation-mode simple_streaming
+```
+
+Example for GLM local estimation:
+
+```bash
+python main.py \
+  --port 8787 \
+  --target-base-url https://open.bigmodel.cn/api/paas/v4 \
+  --tokenizer-preset glm-5.1 \
   --conversation-mode simple_streaming
 ```
 
@@ -80,7 +107,7 @@ python main.py \
 python main.py \
   --port 8787 \
   --target-base-url https://api.deepseek.com \
-  --tokenizer-dir ./deepseek_tokenizer \
+  --tokenizer-preset deepseek-v4-pro \
   --conversation-mode piai_probe
 ```
 
@@ -90,7 +117,7 @@ python main.py \
 python main.py \
   --port 8787 \
   --target-base-url http://127.0.0.1:8000/v1 \
-  --tokenizer-dir ./deepseek_tokenizer \
+  --tokenizer-preset deepseek-v4-pro \
   --conversation-mode vllm_probe \
   --session-id vllm_probe_session
 ```
@@ -105,7 +132,7 @@ python main.py \
   --port 8787 \
   --target-chat-url http://127.0.0.1:8000/v1/chat/completions \
   --vllm-metrics-url http://127.0.0.1:8000/metrics \
-  --tokenizer-dir ./deepseek_tokenizer \
+  --tokenizer-preset deepseek-v4-pro \
   --conversation-mode vllm_probe
 ```
 
@@ -129,6 +156,11 @@ to the same vLLM process if you need precise per-request traces.
 
 - `conversation_mode`
 - `input_token_source`
+- `tokenizer_preset`
+- `tokenizer_effective_preset`
+- `tokenizer_runtime`
+- `tokenizer_dir`
+- `tokenizer_warning`
 - `predicted_input_tokens`
 - `actual_input_tokens`
 - `input_tokens_difference`
@@ -160,6 +192,17 @@ to the same vLLM process if you need precise per-request traces.
 Trace file path:
 
 - `traces/{session_id}.jsonl`
+
+## Tokenizer validation
+
+To compare local prompt-token estimates with provider-reported usage, set provider keys in environment variables or the existing local config, then run:
+
+```bash
+python validate_tokenizers.py --sample short
+python validate_tokenizers.py --sample long-1000
+```
+
+The validation sends a tiny completion request (`max_tokens=1`) to each configured provider and writes local markdown reports. The generated reports are ignored by git and should not contain API keys.
 
 ## Notes
 

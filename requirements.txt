@@ -2,3 +2,6 @@ fastapi
 uvicorn
 httpx
 tokenizers
+transformers
+huggingface_hub
+tiktoken

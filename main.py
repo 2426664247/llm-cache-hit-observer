@@ -11,6 +11,11 @@ from fastapi.responses import JSONResponse
 
 from cache_estimator import estimate_cache_hit
 from request_recorder import RequestRecorder
+from tokenizer_adapters import (
+    SUPPORTED_TOKENIZER_PRESETS,
+    default_tokenizer_dir_for_preset,
+    normalize_tokenizer_preset,
+)
 from usage_reader import read_actual_usage
 from vllm_metrics import (
     VLLM_PROBE_BLOCK_SIZE,
@@ -53,8 +58,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tokenizer-dir",
         type=str,
-        default=str(Path(__file__).resolve().parent / "deepseek_tokenizer"),
-        help="Local DeepSeek tokenizer directory",
+        default=None,
+        help=(
+            "Local tokenizer directory. Defaults to ./deepseek_tokenizer for "
+            "DeepSeek/Doubao fallback and ./tokenizers/<preset> for HF presets."
+        ),
+    )
+    parser.add_argument(
+        "--tokenizer-preset",
+        type=str,
+        default="deepseek-v4-pro",
+        choices=sorted(SUPPORTED_TOKENIZER_PRESETS),
+        help="Local tokenizer preset to use for prompt-token estimation.",
+    )
+    parser.add_argument(
+        "--hf-local-files-only",
+        type=lambda value: str(value).strip().lower() not in {"0", "false", "no", "off"},
+        default=True,
+        help="Load Hugging Face tokenizers from local files only (default: true).",
     )
     parser.add_argument(
         "--block-size",
@@ -116,6 +137,15 @@ def parse_args() -> argparse.Namespace:
         help="Optional trace session id override for reproducible experiment runs",
     )
     args = parser.parse_args()
+
+    args.tokenizer_preset = normalize_tokenizer_preset(args.tokenizer_preset)
+    if args.tokenizer_dir is None:
+        args.tokenizer_dir = str(
+            default_tokenizer_dir_for_preset(
+                args.tokenizer_preset,
+                Path(__file__).resolve().parent,
+            )
+        )
 
     if not args.target_base_url and not args.target_chat_url:
         parser.error("one of --target-base-url or --target-chat-url is required")
@@ -214,6 +244,11 @@ def print_summary(
     print(f"Conversation mode: {conversation_mode}")
     print(f"Local input tokens: {request_record.get('local_input_tokens')}")
     print(f"Input token source: {input_token_source}")
+    print(f"Tokenizer preset: {request_record.get('tokenizer_preset')}")
+    print(f"Tokenizer effective preset: {request_record.get('tokenizer_effective_preset')}")
+    tokenizer_warning = request_record.get("tokenizer_warning")
+    if tokenizer_warning:
+        print(f"Tokenizer warning: {tokenizer_warning}")
     print(f"Cache unit source: {request_record.get('_cache_unit_source')}")
     fallback_reason = request_record.get("_cache_unit_fallback_reason")
     if fallback_reason:
@@ -300,6 +335,11 @@ def build_log_payload(
         "raw_request_body_sha256": request_record.get("raw_request_body_sha256"),
         "raw_request_body_size_bytes": request_record.get("raw_request_body_size_bytes"),
         "raw_request_body_tokenizer_tokens": request_record.get("raw_request_body_tokenizer_tokens"),
+        "tokenizer_preset": request_record.get("tokenizer_preset"),
+        "tokenizer_effective_preset": request_record.get("tokenizer_effective_preset"),
+        "tokenizer_runtime": request_record.get("tokenizer_runtime"),
+        "tokenizer_dir": request_record.get("tokenizer_dir"),
+        "tokenizer_warning": request_record.get("tokenizer_warning"),
         "cache_unit_source": request_record.get("_cache_unit_source"),
         "cache_unit_fallback_reason": request_record.get("_cache_unit_fallback_reason"),
         "cache_block_size": request_record.get("cache_block_size"),
@@ -348,6 +388,8 @@ def create_app(
     vllm_metrics_url: str | None,
     session_id: str,
     tokenizer_dir: str,
+    tokenizer_preset: str,
+    hf_local_files_only: bool,
     block_size: int,
     cache_idle_ttl_hours: float,
     max_history_requests: int,
@@ -361,6 +403,8 @@ def create_app(
     recorder = RequestRecorder(
         str(traces_dir),
         tokenizer_dir=tokenizer_dir,
+        tokenizer_preset=tokenizer_preset,
+        hf_local_files_only=hf_local_files_only,
         block_size=block_size,
         cache_idle_ttl_hours=cache_idle_ttl_hours,
         max_history_requests=max_history_requests,
@@ -435,6 +479,11 @@ def create_app(
                 "cache_estimation_input_tokens": 0,
                 "_cache_unit_source": "deepseek_prompt_encoding",
                 "_cache_unit_fallback_reason": "create_request_record_failed",
+                "tokenizer_preset": tokenizer_preset,
+                "tokenizer_effective_preset": tokenizer_preset,
+                "tokenizer_runtime": "local",
+                "tokenizer_dir": tokenizer_dir,
+                "tokenizer_warning": "create_request_record_failed",
             }
 
         predicted_input_tokens = request_record.get("local_input_tokens", 0)
@@ -652,6 +701,8 @@ def main() -> None:
         args.vllm_metrics_url,
         session_id,
         tokenizer_dir=str(tokenizer_path),
+        tokenizer_preset=args.tokenizer_preset,
+        hf_local_files_only=args.hf_local_files_only,
         block_size=args.block_size,
         cache_idle_ttl_hours=args.cache_idle_ttl_hours,
         max_history_requests=args.max_history_requests,
@@ -671,6 +722,8 @@ def main() -> None:
     if args.conversation_mode == "vllm_probe":
         print(f"vLLM metrics URL: {resolved_vllm_metrics_url}")
     print(f"Tokenizer dir: {tokenizer_path}")
+    print(f"Tokenizer preset: {args.tokenizer_preset}")
+    print(f"HF local files only: {args.hf_local_files_only}")
     print(f"Block size: {args.block_size}")
     print(f"Cache idle TTL (hours): {args.cache_idle_ttl_hours}")
     if args.max_history_requests > 0:

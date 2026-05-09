@@ -8,9 +8,9 @@ from statistics import median
 from typing import Any, Dict, List, Optional
 
 try:
-    from deepseek_encoding import encode_messages
+    from tokenizer_adapters import TokenizerAdapter, create_tokenizer_adapter
 except Exception:  # pragma: no cover - package execution path
-    from .deepseek_encoding import encode_messages  # type: ignore
+    from .tokenizer_adapters import TokenizerAdapter, create_tokenizer_adapter  # type: ignore
 
 
 def _stable_to_text(value: Any) -> str:
@@ -208,38 +208,25 @@ def _extract_assistant_message_from_response(response_json: Any) -> Optional[Dic
     return None
 
 
-class DeepSeekTokenizer:
-    def __init__(self, tokenizer_dir: str) -> None:
-        try:
-            from tokenizers import Tokenizer  # type: ignore
-        except Exception as exc:
-            raise RuntimeError(
-                "DeepSeek tokenizer requires 'tokenizers'. "
-                "Please install dependencies from requirements.txt."
-            ) from exc
-
-        tokenizer_path = Path(tokenizer_dir) / "tokenizer.json"
-        if not tokenizer_path.exists():
-            raise RuntimeError(f"tokenizer.json not found: {tokenizer_path}")
-        self.tokenizer = Tokenizer.from_file(str(tokenizer_path))
-
-    def tokenize_text(self, text: str) -> List[int]:
-        encoded = self.tokenizer.encode(text)
-        return [int(t) for t in encoded.ids]
-
-
 class RequestRecorder:
     def __init__(
         self,
         traces_dir: str,
         tokenizer_dir: str,
+        tokenizer_preset: str = "deepseek-v4-pro",
+        hf_local_files_only: bool = True,
         block_size: int = 64,
         cache_idle_ttl_hours: float = 24.0,
         max_history_requests: int = 0,
+        tokenizer_adapter: Optional[TokenizerAdapter] = None,
     ) -> None:
         self.traces_dir = Path(traces_dir)
         self.traces_dir.mkdir(parents=True, exist_ok=True)
-        self._tokenizer = DeepSeekTokenizer(tokenizer_dir)
+        self._tokenizer = tokenizer_adapter or create_tokenizer_adapter(
+            preset=tokenizer_preset,
+            tokenizer_dir=tokenizer_dir,
+            hf_local_files_only=hf_local_files_only,
+        )
         self._history: List[Dict[str, Any]] = []
         self._lock = Lock()
         self._block_size = max(int(block_size), 1)
@@ -279,6 +266,11 @@ class RequestRecorder:
         thinking_mode: str,
         reasoning_effort: Optional[str] = None,
     ) -> str:
+        try:
+            from deepseek_encoding import encode_messages
+        except Exception:  # pragma: no cover - package execution path
+            from .deepseek_encoding import encode_messages  # type: ignore
+
         try:
             return encode_messages(
                 messages,
@@ -351,12 +343,19 @@ class RequestRecorder:
         else:
             messages_for_encoding = _normalize_messages_for_v4(messages)
 
-        prompt_text = self._encode_prompt(
-            messages_for_encoding,
-            thinking_mode=thinking_mode,
-            reasoning_effort=reasoning_effort,
-        )
-        token_ids = self._tokenizer.tokenize_text(prompt_text)
+        if self._tokenizer.info.effective_preset == "deepseek-v4-pro":
+            prompt_text = self._encode_prompt(
+                messages_for_encoding,
+                thinking_mode=thinking_mode,
+                reasoning_effort=reasoning_effort,
+            )
+            token_ids = self._tokenizer.tokenize_text(prompt_text)
+        else:
+            token_ids = self._tokenizer.tokenize_messages(
+                messages_for_encoding,
+                thinking_mode=thinking_mode,
+                reasoning_effort=reasoning_effort,
+            )
         raw_body_sha256: Optional[str] = None
         raw_body_size_bytes = 0
         raw_body_token_count: Optional[int] = None
@@ -400,6 +399,11 @@ class RequestRecorder:
             ),
             "_cache_unit_source": "deepseek_prompt_encoding",
             "_cache_unit_fallback_reason": None,
+            "tokenizer_preset": self._tokenizer.info.preset,
+            "tokenizer_effective_preset": self._tokenizer.info.effective_preset,
+            "tokenizer_runtime": self._tokenizer.info.runtime,
+            "tokenizer_dir": self._tokenizer.info.tokenizer_dir,
+            "tokenizer_warning": self._tokenizer.info.warning,
             "_thinking_mode": thinking_mode,
             "_reasoning_effort": reasoning_effort,
             "_messages_for_encoding": messages_for_encoding,
@@ -469,12 +473,20 @@ class RequestRecorder:
 
             output_messages = copy.deepcopy(base_messages)
             output_messages.append(assistant_message)
-            output_prompt = self._encode_prompt(
-                output_messages,
-                thinking_mode=thinking_mode,
-                reasoning_effort=reasoning_effort,
-            )
-            output_tokens = self._tokenizer.tokenize_text(output_prompt)
+            if self._tokenizer.info.effective_preset == "deepseek-v4-pro":
+                output_prompt = self._encode_prompt(
+                    output_messages,
+                    thinking_mode=thinking_mode,
+                    reasoning_effort=reasoning_effort,
+                )
+                output_tokens = self._tokenizer.tokenize_text(output_prompt)
+            else:
+                output_tokens = self._tokenizer.tokenize_messages(
+                    output_messages,
+                    thinking_mode=thinking_mode,
+                    reasoning_effort=reasoning_effort,
+                    add_generation_prompt=False,
+                )
             snapped_len = _snap_down(len(output_tokens), self._block_size)
             if snapped_len > 0:
                 # Output boundary unit: include assistant turn, then align and persist.
