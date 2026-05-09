@@ -20,6 +20,7 @@ from usage_reader import read_actual_usage
 from vllm_metrics import (
     VLLM_PROBE_BLOCK_SIZE,
     compute_vllm_metrics_delta,
+    parse_vllm_block_size,
     parse_vllm_metrics_text,
     read_actual_usage_from_vllm_metrics,
 )
@@ -76,6 +77,27 @@ def parse_args() -> argparse.Namespace:
         type=lambda value: str(value).strip().lower() not in {"0", "false", "no", "off"},
         default=True,
         help="Load Hugging Face tokenizers from local files only (default: true).",
+    )
+    parser.add_argument(
+        "--vllm-tokenize-url",
+        type=str,
+        default=None,
+        help=(
+            "vLLM /tokenize URL for --tokenizer-preset vllm. "
+            "Defaults to TARGET_BASE_URL without /v1 plus /tokenize."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-tokenizer-model",
+        type=str,
+        default=None,
+        help="Optional model name for vLLM /tokenize. Defaults to each request body model.",
+    )
+    parser.add_argument(
+        "--vllm-tokenize-timeout",
+        type=float,
+        default=120.0,
+        help="Timeout seconds for vLLM /tokenize requests (default: 120).",
     )
     parser.add_argument(
         "--block-size",
@@ -151,9 +173,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("one of --target-base-url or --target-chat-url is required")
 
     if args.conversation_mode == "vllm_probe":
-        if args.block_size is not None and args.block_size != VLLM_PROBE_BLOCK_SIZE:
-            parser.error(f"vllm_probe requires --block-size {VLLM_PROBE_BLOCK_SIZE}")
-        args.block_size = VLLM_PROBE_BLOCK_SIZE
+        if args.block_size is None:
+            args.block_size = VLLM_PROBE_BLOCK_SIZE
         if not args.vllm_metrics_url and not args.target_base_url:
             parser.error("vllm_probe requires --vllm-metrics-url when --target-base-url is absent")
     elif args.block_size is None:
@@ -207,6 +228,21 @@ def resolve_vllm_metrics_url(
     if base.endswith("/v1"):
         base = base[: -len("/v1")]
     return f"{base}/metrics"
+
+
+def resolve_vllm_tokenize_url(
+    target_base_url: str | None,
+    vllm_tokenize_url: str | None,
+) -> str | None:
+    if vllm_tokenize_url:
+        return vllm_tokenize_url.rstrip("/")
+    if not target_base_url:
+        return None
+
+    base = target_base_url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    return f"{base}/tokenize"
 
 
 def filter_request_headers(headers: Dict[str, str]) -> Dict[str, str]:
@@ -367,6 +403,8 @@ def build_log_payload(
     }
     if vllm_metrics_details is not None:
         payload.update(vllm_metrics_details)
+    if conversation_mode == "vllm_probe":
+        payload["vllm_block_size_warning"] = request_record.get("vllm_block_size_warning")
     return payload
 
 
@@ -397,27 +435,48 @@ def create_app(
     input_token_source: str,
     raw_request_capture: str,
     raw_request_max_chars: int,
+    vllm_tokenize_url: str | None = None,
+    vllm_tokenizer_model: str | None = None,
+    vllm_tokenize_timeout: float = 120.0,
 ) -> FastAPI:
     app = FastAPI(title="Cache Hit Proxy", version="0.2.0")
     traces_dir = Path(__file__).resolve().parent / "traces"
-    recorder = RequestRecorder(
-        str(traces_dir),
-        tokenizer_dir=tokenizer_dir,
-        tokenizer_preset=tokenizer_preset,
-        hf_local_files_only=hf_local_files_only,
-        block_size=block_size,
-        cache_idle_ttl_hours=cache_idle_ttl_hours,
-        max_history_requests=max_history_requests,
-    )
     chat_url = resolve_target_chat_url(target_base_url, target_chat_url)
     resolved_vllm_metrics_url = resolve_vllm_metrics_url(
         target_base_url=target_base_url,
         target_chat_url=target_chat_url,
         vllm_metrics_url=vllm_metrics_url,
     )
+    effective_block_size = block_size
+    vllm_block_size_warning: str | None = None
+    if conversation_mode == "vllm_probe" and resolved_vllm_metrics_url:
+        try:
+            metrics_response = httpx.get(resolved_vllm_metrics_url, timeout=10.0)
+            metrics_response.raise_for_status()
+            parsed_block_size = parse_vllm_block_size(metrics_response.text)
+            if isinstance(parsed_block_size, int) and parsed_block_size > 0:
+                effective_block_size = parsed_block_size
+            else:
+                vllm_block_size_warning = "block_size_not_found_in_metrics"
+        except Exception as exc:
+            vllm_block_size_warning = str(exc)
+    recorder = RequestRecorder(
+        str(traces_dir),
+        tokenizer_dir=tokenizer_dir,
+        tokenizer_preset=tokenizer_preset,
+        hf_local_files_only=hf_local_files_only,
+        block_size=effective_block_size,
+        cache_idle_ttl_hours=cache_idle_ttl_hours,
+        max_history_requests=max_history_requests,
+        vllm_tokenize_url=vllm_tokenize_url,
+        vllm_tokenizer_model=vllm_tokenizer_model,
+        vllm_tokenize_timeout=vllm_tokenize_timeout,
+    )
 
     app.state.request_counter = 0
     app.state.session_id = session_id
+    app.state.effective_block_size = effective_block_size
+    app.state.vllm_block_size_warning = vllm_block_size_warning
 
     @app.post("/v1/chat/completions")
     async def proxy_chat_completions(request: Request) -> Response:
@@ -460,6 +519,7 @@ def create_app(
                 request_record=request_record,
                 input_token_source=input_token_source,
             )
+            request_record["vllm_block_size_warning"] = vllm_block_size_warning
         except Exception:
             request_record = {
                 "session_id": session_id,
@@ -475,7 +535,7 @@ def create_app(
                 "raw_request_body_tokenizer_tokens": None,
                 "raw_request_body_token_ids": [],
                 "persisted_prefix_units_tokens": [],
-                "cache_block_size": block_size,
+                "cache_block_size": effective_block_size,
                 "cache_estimation_input_tokens": 0,
                 "_cache_unit_source": "deepseek_prompt_encoding",
                 "_cache_unit_fallback_reason": "create_request_record_failed",
@@ -484,6 +544,7 @@ def create_app(
                 "tokenizer_runtime": "local",
                 "tokenizer_dir": tokenizer_dir,
                 "tokenizer_warning": "create_request_record_failed",
+                "vllm_block_size_warning": vllm_block_size_warning,
             }
 
         predicted_input_tokens = request_record.get("local_input_tokens", 0)
@@ -687,11 +748,19 @@ def create_app(
 
 def main() -> None:
     args = parse_args()
+    resolved_vllm_tokenize_url = resolve_vllm_tokenize_url(
+        args.target_base_url,
+        args.vllm_tokenize_url,
+    )
     tokenizer_path = Path(args.tokenizer_dir).resolve()
-    if not tokenizer_path.exists():
+    if args.tokenizer_preset != "vllm" and not tokenizer_path.exists():
         raise SystemExit(
             f"Tokenizer directory not found: {tokenizer_path}. "
             "Please download DeepSeek tokenizer files first."
+        )
+    if args.tokenizer_preset == "vllm" and not resolved_vllm_tokenize_url:
+        raise SystemExit(
+            "--tokenizer-preset vllm requires --vllm-tokenize-url when --target-base-url is absent"
         )
 
     session_id = args.session_id or make_session_id()
@@ -710,6 +779,9 @@ def main() -> None:
         input_token_source=args.input_token_source,
         raw_request_capture=args.raw_request_capture,
         raw_request_max_chars=max(args.raw_request_max_chars, 0),
+        vllm_tokenize_url=resolved_vllm_tokenize_url,
+        vllm_tokenizer_model=args.vllm_tokenizer_model,
+        vllm_tokenize_timeout=args.vllm_tokenize_timeout,
     )
     print(f"Session ID: {session_id}")
     print(f"Target base URL: {args.target_base_url}")
@@ -723,8 +795,14 @@ def main() -> None:
         print(f"vLLM metrics URL: {resolved_vllm_metrics_url}")
     print(f"Tokenizer dir: {tokenizer_path}")
     print(f"Tokenizer preset: {args.tokenizer_preset}")
+    if args.tokenizer_preset == "vllm":
+        print(f"vLLM tokenize URL: {resolved_vllm_tokenize_url}")
+        print(f"vLLM tokenizer model: {args.vllm_tokenizer_model or '(request model)'}")
+        print(f"vLLM tokenize timeout: {args.vllm_tokenize_timeout}")
     print(f"HF local files only: {args.hf_local_files_only}")
-    print(f"Block size: {args.block_size}")
+    print(f"Block size: {getattr(app.state, 'effective_block_size', args.block_size)}")
+    if getattr(app.state, "vllm_block_size_warning", None):
+        print(f"vLLM block size warning: {app.state.vllm_block_size_warning}")
     print(f"Cache idle TTL (hours): {args.cache_idle_ttl_hours}")
     if args.max_history_requests > 0:
         print(f"Max history requests: {args.max_history_requests}")

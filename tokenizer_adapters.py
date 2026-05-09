@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
 
+import httpx
+
 try:
     from deepseek_encoding import encode_messages
 except Exception:  # pragma: no cover - package execution path
@@ -17,6 +19,7 @@ SUPPORTED_TOKENIZER_PRESETS = {
     "kimi-k2.6",
     "doubao-seed-2-0-code-preview-260215",
     "volcanoengine",
+    "vllm",
 }
 
 HF_REPO_BY_PRESET = {
@@ -58,6 +61,9 @@ class TokenizerAdapter(Protocol):
     ) -> List[int]:
         ...
 
+    def tokenize_request_body(self, request_body: Dict[str, Any]) -> List[int]:
+        ...
+
 
 def normalize_tokenizer_preset(preset: Optional[str]) -> str:
     normalized = (preset or "deepseek-v4-pro").strip().lower()
@@ -70,11 +76,14 @@ def normalize_tokenizer_preset(preset: Optional[str]) -> str:
         "glm_5_1": "glm-5.1",
         "qwen": "qwen3-coder-plus",
         "qwen3_coder_plus": "qwen3-coder-plus",
+        "qwen3-coder": "qwen3-coder-plus",
         "kimi": "kimi-k2.6",
         "kimi_k2_6": "kimi-k2.6",
         "doubao": "doubao-seed-2-0-code-preview-260215",
         "volcano": "volcanoengine",
         "volcano_engine": "volcanoengine",
+        "vllm-http": "vllm",
+        "vllm_http": "vllm",
     }
     normalized = aliases.get(normalized, normalized)
     if normalized not in SUPPORTED_TOKENIZER_PRESETS:
@@ -91,6 +100,8 @@ def effective_tokenizer_preset(preset: str) -> str:
 
 def default_tokenizer_dir_for_preset(preset: str, base_dir: Path) -> Path:
     effective = effective_tokenizer_preset(normalize_tokenizer_preset(preset))
+    if effective == "vllm":
+        return Path("vllm-http")
     if effective == "deepseek-v4-pro":
         return base_dir / "deepseek_tokenizer"
     return base_dir / "tokenizers" / effective
@@ -145,6 +156,17 @@ class DeepSeekV4TokenizerAdapter:
             reasoning_effort=reasoning_effort,
         )
         return self.tokenize_text(prompt_text)
+
+    def tokenize_request_body(self, request_body: Dict[str, Any]) -> List[int]:
+        messages = request_body.get("messages", [])
+        normalized = _prepare_hf_messages(messages) if isinstance(messages, list) else []
+        if not normalized:
+            normalized = [{"role": "user", "content": _stable_to_text(messages)}]
+        return self.tokenize_messages(
+            normalized,
+            thinking_mode="thinking" if _request_body_thinking_enabled(request_body) else "chat",
+            reasoning_effort=_request_body_reasoning_effort(request_body),
+        )
 
 
 class HuggingFaceChatTemplateTokenizerAdapter:
@@ -202,6 +224,118 @@ class HuggingFaceChatTemplateTokenizerAdapter:
             token_ids = token_ids.get("input_ids", [])
         return [int(t) for t in token_ids]
 
+    def tokenize_request_body(self, request_body: Dict[str, Any]) -> List[int]:
+        messages = request_body.get("messages", [])
+        if not isinstance(messages, list):
+            messages = [{"role": "user", "content": _stable_to_text(messages)}]
+        return self.tokenize_messages(
+            messages,
+            thinking_mode="thinking" if _request_body_thinking_enabled(request_body) else "chat",
+            reasoning_effort=_request_body_reasoning_effort(request_body),
+        )
+
+
+class VllmHttpTokenizerAdapter:
+    TOKENIZER_REQUEST_COPY_KEYS = (
+        "model",
+        "messages",
+        "chat_template_kwargs",
+        "tools",
+        "tool_choice",
+        "add_generation_prompt",
+        "continue_final_message",
+        "documents",
+    )
+
+    def __init__(
+        self,
+        tokenize_url: str,
+        model: Optional[str] = None,
+        timeout_seconds: float = 120.0,
+    ) -> None:
+        url = tokenize_url.strip().rstrip("/")
+        if not url:
+            raise RuntimeError("vLLM tokenizer requires a non-empty /tokenize URL")
+        self.tokenize_url = url
+        self.model = model.strip() if isinstance(model, str) and model.strip() else None
+        self.timeout_seconds = max(float(timeout_seconds), 1.0)
+        self.info = TokenizerInfo(
+            preset="vllm",
+            effective_preset="vllm",
+            tokenizer_dir=self.tokenize_url,
+            runtime="vllm_http",
+        )
+
+    def _post_tokenize(self, payload: Dict[str, Any]) -> List[int]:
+        if self.model and not payload.get("model"):
+            payload["model"] = self.model
+        payload = {key: value for key, value in payload.items() if value is not None}
+        response = httpx.post(self.tokenize_url, json=payload, timeout=self.timeout_seconds)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise RuntimeError(f"unexpected vLLM /tokenize response: {str(data)[:400]}")
+        tokens = data.get("tokens")
+        if isinstance(tokens, list):
+            return [int(token) for token in tokens]
+        count = data.get("count") or data.get("num_tokens")
+        if isinstance(count, int):
+            # vLLM normally returns token ids. This fallback preserves token counts
+            # for older/custom servers that only expose count.
+            return list(range(count))
+        raise RuntimeError(f"unexpected vLLM /tokenize response: {str(data)[:400]}")
+
+    def tokenize_text(self, text: str) -> List[int]:
+        return self._post_tokenize({"model": self.model, "prompt": text})
+
+    def tokenize_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        thinking_mode: str,
+        reasoning_effort: Optional[str] = None,
+        add_generation_prompt: bool = True,
+    ) -> List[int]:
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "add_generation_prompt": add_generation_prompt,
+        }
+        return self._post_tokenize(payload)
+
+    def tokenize_request_body(self, request_body: Dict[str, Any]) -> List[int]:
+        payload: Dict[str, Any] = {}
+        for key in self.TOKENIZER_REQUEST_COPY_KEYS:
+            if key in request_body:
+                payload[key] = request_body[key]
+        if "messages" not in payload:
+            prompt = request_body.get("prompt", request_body.get("input", ""))
+            payload["prompt"] = _stable_to_text(prompt)
+        if self.model and not payload.get("model"):
+            payload["model"] = self.model
+        return self._post_tokenize(payload)
+
+
+def _stable_to_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    import json
+
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _request_body_thinking_enabled(request_body: Dict[str, Any]) -> bool:
+    thinking = request_body.get("thinking")
+    if isinstance(thinking, dict):
+        return str(thinking.get("type", "")).strip().lower() == "enabled"
+    return "reasoner" in str(request_body.get("model", "")).lower()
+
+
+def _request_body_reasoning_effort(request_body: Dict[str, Any]) -> Optional[str]:
+    value = request_body.get("reasoning_effort")
+    if isinstance(value, str) and value.strip().lower() in {"high", "max"}:
+        return value.strip().lower()
+    return None
+
 
 def _prepare_hf_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     prepared: List[Dict[str, Any]] = []
@@ -228,9 +362,18 @@ def create_tokenizer_adapter(
     preset: str,
     tokenizer_dir: str,
     hf_local_files_only: bool = True,
+    vllm_tokenize_url: Optional[str] = None,
+    vllm_tokenizer_model: Optional[str] = None,
+    vllm_tokenize_timeout: float = 120.0,
 ) -> TokenizerAdapter:
     normalized = normalize_tokenizer_preset(preset)
     effective = effective_tokenizer_preset(normalized)
+    if effective == "vllm":
+        return VllmHttpTokenizerAdapter(
+            tokenize_url=vllm_tokenize_url or tokenizer_dir,
+            model=vllm_tokenizer_model,
+            timeout_seconds=vllm_tokenize_timeout,
+        )
     if effective == "deepseek-v4-pro":
         return DeepSeekV4TokenizerAdapter(tokenizer_dir=tokenizer_dir, preset=normalized)
     return HuggingFaceChatTemplateTokenizerAdapter(

@@ -112,6 +112,42 @@ def parse_vllm_metrics_text(metrics_text: str) -> Dict[str, float]:
     }
 
 
+def parse_vllm_cache_config(metrics_text: str) -> Dict[str, str]:
+    for raw_line in metrics_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _SAMPLE_RE.match(line)
+        if not match:
+            continue
+        name, raw_labels, raw_value = match.groups()
+        if name != "vllm:cache_config_info":
+            continue
+        try:
+            value = float(raw_value)
+        except ValueError:
+            continue
+        if value != 1.0:
+            continue
+        return _parse_labels(raw_labels)
+    return {}
+
+
+def parse_vllm_block_size(metrics_text: str) -> Optional[int]:
+    config = parse_vllm_cache_config(metrics_text)
+    for key in ("block_size", "mamba_block_size"):
+        raw = config.get(key)
+        if raw is None:
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        if value > 0:
+            return value
+    return None
+
+
 def compute_vllm_metrics_delta(
     before: Optional[Dict[str, float]],
     after: Optional[Dict[str, float]],

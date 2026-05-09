@@ -28,8 +28,9 @@ prompt token 估算全部在本地完成，通过 `--tokenizer-preset` 选择 to
 - `qwen3-coder-plus`：使用本地 Qwen3-Coder tokenizer 和官方 chat template。
 - `kimi-k2.6`：使用本地 Kimi tokenizer 和官方 chat template。
 - `doubao-seed-2-0-code-preview-260215` / `volcanoengine`：fallback 到 DeepSeek tokenizer，可本地估算，但会有误差。
+- `vllm`：调用正在运行的 vLLM server `/tokenize`，适合泛用 vLLM OpenAI-compatible 服务。
 
-DeepSeek 和 Doubao fallback 默认使用 `./deepseek_tokenizer`。GLM、Qwen、Kimi 默认使用 `./tokenizers/<preset>`。如需指定其他目录，使用 `--tokenizer-dir`。
+DeepSeek 和 Doubao fallback 默认使用 `./deepseek_tokenizer`。GLM、Qwen、Kimi 默认使用 `./tokenizers/<preset>`。如需指定其他目录，使用 `--tokenizer-dir`。`vllm` 默认由 `--target-base-url` 推导 `/tokenize`，也可通过 `--vllm-tokenize-url` 显式指定。
 
 只下载或检查 tokenizer 文件：
 
@@ -100,19 +101,20 @@ python main.py \
 python main.py \
   --port 8787 \
   --target-base-url http://127.0.0.1:8000/v1 \
-  --tokenizer-preset deepseek-v4-pro \
+  --tokenizer-preset vllm \
   --conversation-mode vllm_probe \
   --session-id vllm_probe_session
 ```
 
-`vllm_probe` 会强制使用 `--block-size 784`。如果使用 `--target-chat-url` 而不是 `--target-base-url`，还需要传入 `--vllm-metrics-url`：
+`vllm_probe` 会优先从 vLLM `/metrics` 的 `vllm:cache_config_info` 读取真实 `block_size`；读不到时回退到 `--block-size`，默认 `784`。如果使用 `--target-chat-url` 而不是 `--target-base-url`，还需要传入 `--vllm-metrics-url` 和 `--vllm-tokenize-url`：
 
 ```bash
 python main.py \
   --port 8787 \
   --target-chat-url http://127.0.0.1:8000/v1/chat/completions \
   --vllm-metrics-url http://127.0.0.1:8000/metrics \
-  --tokenizer-preset deepseek-v4-pro \
+  --vllm-tokenize-url http://127.0.0.1:8000/tokenize \
+  --tokenizer-preset vllm \
   --conversation-mode vllm_probe
 ```
 
@@ -165,6 +167,7 @@ python validate_tokenizers.py --sample long-1000
 - `vllm_metrics_url`
 - `vllm_prompt_tokens_cached_delta`
 - `vllm_metrics_error`
+- `vllm_block_size_warning`
 
 Trace 路径：
 
@@ -208,8 +211,9 @@ Prompt-token estimation runs locally. Pick a tokenizer with `--tokenizer-preset`
 - `qwen3-coder-plus`: local Qwen3-Coder tokenizer and official chat template.
 - `kimi-k2.6`: local Kimi tokenizer and official chat template.
 - `doubao-seed-2-0-code-preview-260215` / `volcanoengine`: DeepSeek tokenizer fallback, usable locally with expected drift.
+- `vllm`: calls a running vLLM server `/tokenize`, suitable for generic vLLM OpenAI-compatible services.
 
-DeepSeek and Doubao fallback use `./deepseek_tokenizer` by default. GLM, Qwen, and Kimi use `./tokenizers/<preset>` by default. Use `--tokenizer-dir` to override the directory.
+DeepSeek and Doubao fallback use `./deepseek_tokenizer` by default. GLM, Qwen, and Kimi use `./tokenizers/<preset>` by default. Use `--tokenizer-dir` to override the directory. `vllm` derives `/tokenize` from `--target-base-url` by default, or accepts `--vllm-tokenize-url`.
 
 Download or check tokenizer-only files:
 
@@ -280,19 +284,20 @@ python main.py \
 python main.py \
   --port 8787 \
   --target-base-url http://127.0.0.1:8000/v1 \
-  --tokenizer-preset deepseek-v4-pro \
+  --tokenizer-preset vllm \
   --conversation-mode vllm_probe \
   --session-id vllm_probe_session
 ```
 
-`vllm_probe` forces `--block-size 784`. If you use `--target-chat-url` instead of `--target-base-url`, also pass `--vllm-metrics-url`:
+`vllm_probe` first reads the real `block_size` from `vllm:cache_config_info` on `/metrics`; if unavailable, it falls back to `--block-size`, defaulting to `784`. If you use `--target-chat-url` instead of `--target-base-url`, also pass `--vllm-metrics-url` and `--vllm-tokenize-url`:
 
 ```bash
 python main.py \
   --port 8787 \
   --target-chat-url http://127.0.0.1:8000/v1/chat/completions \
   --vllm-metrics-url http://127.0.0.1:8000/metrics \
-  --tokenizer-preset deepseek-v4-pro \
+  --vllm-tokenize-url http://127.0.0.1:8000/tokenize \
+  --tokenizer-preset vllm \
   --conversation-mode vllm_probe
 ```
 
@@ -345,6 +350,7 @@ Common fields:
 - `vllm_metrics_url`
 - `vllm_prompt_tokens_cached_delta`
 - `vllm_metrics_error`
+- `vllm_block_size_warning`
 
 Trace path:
 

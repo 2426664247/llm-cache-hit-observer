@@ -121,6 +121,8 @@ def estimate_cache_hit(
 
         hit_rate = (best_cached_tokens / denominator_tokens) if denominator_tokens > 0 else 0.0
         match_strategy = "raw_body_lcp_block_aligned"
+    elif current_source == "vllm_prompt_encoding":
+        match_strategy = "vllm_boundary_prefix_match"
     else:
         match_strategy = "deepseek_boundary_prefix_match"
 

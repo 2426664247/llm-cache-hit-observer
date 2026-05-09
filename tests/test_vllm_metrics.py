@@ -7,6 +7,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from vllm_metrics import (  # noqa: E402
     compute_vllm_metrics_delta,
+    parse_vllm_block_size,
+    parse_vllm_cache_config,
     parse_vllm_metrics_text,
     read_actual_usage_from_vllm_metrics,
 )
@@ -28,6 +30,16 @@ vllm:prompt_tokens_by_source_total{engine="0",model_name="qwen",source="local_co
         self.assertEqual(parsed["vllm_prefix_cache_queries"], 1568.0)
         self.assertEqual(parsed["vllm_prompt_tokens_local_cache_hit"], 784.0)
         self.assertEqual(parsed["vllm_prompt_tokens_local_compute"], 800.0)
+
+    def test_parse_cache_config_block_size(self) -> None:
+        metrics = """
+# HELP vllm:cache_config_info Information of the LLMEngine CacheConfig
+vllm:cache_config_info{engine="0",model_name="qwen",block_size="784",mamba_block_size="784",enable_prefix_caching="True"} 1.0
+"""
+        config = parse_vllm_cache_config(metrics)
+        self.assertEqual(config["block_size"], "784")
+        self.assertEqual(config["enable_prefix_caching"], "True")
+        self.assertEqual(parse_vllm_block_size(metrics), 784)
 
     def test_compute_delta_and_usage_metrics(self) -> None:
         before = {

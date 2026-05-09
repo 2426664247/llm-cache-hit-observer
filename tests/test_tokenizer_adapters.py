@@ -2,6 +2,7 @@ import sys
 import unittest
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from unittest.mock import patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -9,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from request_recorder import RequestRecorder  # noqa: E402
 from tokenizer_adapters import (  # noqa: E402
     TokenizerInfo,
+    VllmHttpTokenizerAdapter,
     default_tokenizer_dir_for_preset,
     effective_tokenizer_preset,
     normalize_tokenizer_preset,
@@ -65,6 +67,7 @@ class TokenizerAdapterTests(unittest.TestCase):
             default_tokenizer_dir_for_preset("volcanoengine", base),
             base / "deepseek_tokenizer",
         )
+        self.assertEqual(default_tokenizer_dir_for_preset("vllm", base), Path("vllm-http"))
 
     def test_request_recorder_uses_adapter_metadata(self) -> None:
         recorder = RequestRecorder(
@@ -90,6 +93,41 @@ class TokenizerAdapterTests(unittest.TestCase):
         self.assertEqual(record["tokenizer_effective_preset"], "glm-5.1")
         self.assertGreater(record["local_input_tokens"], 0)
         self.assertEqual(record["tokenizer_runtime"], "local")
+
+    def test_vllm_http_tokenizer_uses_tokenize_tokens(self) -> None:
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> Dict[str, Any]:
+                return {"count": 3, "max_model_len": 67424, "tokens": [11, 22, 33]}
+
+        calls: List[Dict[str, Any]] = []
+
+        def fake_post(url: str, json: Dict[str, Any], timeout: float) -> FakeResponse:
+            calls.append({"url": url, "json": json, "timeout": timeout})
+            return FakeResponse()
+
+        adapter = VllmHttpTokenizerAdapter(
+            tokenize_url="http://127.0.0.1:18000/tokenize",
+            model="served-model",
+            timeout_seconds=7,
+        )
+        body = {
+            "model": "request-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "chat_template_kwargs": {"enable_thinking": False},
+            "temperature": 0,
+        }
+        with patch("tokenizer_adapters.httpx.post", side_effect=fake_post):
+            token_ids = adapter.tokenize_request_body(body)
+
+        self.assertEqual(token_ids, [11, 22, 33])
+        self.assertEqual(calls[0]["url"], "http://127.0.0.1:18000/tokenize")
+        self.assertEqual(calls[0]["timeout"], 7)
+        self.assertEqual(calls[0]["json"]["model"], "request-model")
+        self.assertIn("chat_template_kwargs", calls[0]["json"])
+        self.assertNotIn("temperature", calls[0]["json"])
 
 
 if __name__ == "__main__":

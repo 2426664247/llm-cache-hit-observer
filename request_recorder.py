@@ -219,6 +219,9 @@ class RequestRecorder:
         cache_idle_ttl_hours: float = 24.0,
         max_history_requests: int = 0,
         tokenizer_adapter: Optional[TokenizerAdapter] = None,
+        vllm_tokenize_url: Optional[str] = None,
+        vllm_tokenizer_model: Optional[str] = None,
+        vllm_tokenize_timeout: float = 120.0,
     ) -> None:
         self.traces_dir = Path(traces_dir)
         self.traces_dir.mkdir(parents=True, exist_ok=True)
@@ -226,6 +229,9 @@ class RequestRecorder:
             preset=tokenizer_preset,
             tokenizer_dir=tokenizer_dir,
             hf_local_files_only=hf_local_files_only,
+            vllm_tokenize_url=vllm_tokenize_url,
+            vllm_tokenizer_model=vllm_tokenizer_model,
+            vllm_tokenize_timeout=vllm_tokenize_timeout,
         )
         self._history: List[Dict[str, Any]] = []
         self._lock = Lock()
@@ -279,6 +285,11 @@ class RequestRecorder:
             )
         except Exception:
             return canonicalize_messages(messages)
+
+    def _prompt_encoding_source(self) -> str:
+        if self._tokenizer.info.effective_preset == "vllm":
+            return "vllm_prompt_encoding"
+        return "deepseek_prompt_encoding"
 
     def _load_openclaw_global_floor_by_model(self) -> Dict[str, int]:
         # OpenClaw-only seed floor from historical traces, so first turn can
@@ -350,6 +361,8 @@ class RequestRecorder:
                 reasoning_effort=reasoning_effort,
             )
             token_ids = self._tokenizer.tokenize_text(prompt_text)
+        elif self._tokenizer.info.effective_preset == "vllm":
+            token_ids = self._tokenizer.tokenize_request_body(body)
         else:
             token_ids = self._tokenizer.tokenize_messages(
                 messages_for_encoding,
@@ -397,7 +410,7 @@ class RequestRecorder:
                 str(body.get("model", "")),
                 0,
             ),
-            "_cache_unit_source": "deepseek_prompt_encoding",
+            "_cache_unit_source": self._prompt_encoding_source(),
             "_cache_unit_fallback_reason": None,
             "tokenizer_preset": self._tokenizer.info.preset,
             "tokenizer_effective_preset": self._tokenizer.info.effective_preset,
@@ -407,6 +420,7 @@ class RequestRecorder:
             "_thinking_mode": thinking_mode,
             "_reasoning_effort": reasoning_effort,
             "_messages_for_encoding": messages_for_encoding,
+            "_request_body_for_tokenizer": copy.deepcopy(body),
         }
 
     def apply_input_token_source(
@@ -415,7 +429,7 @@ class RequestRecorder:
         input_token_source: str,
     ) -> Dict[str, Any]:
         if input_token_source != "openclaw_raw_body":
-            request_record["_cache_unit_source"] = "deepseek_prompt_encoding"
+            request_record["_cache_unit_source"] = self._prompt_encoding_source()
             request_record["_cache_unit_fallback_reason"] = None
             return request_record
 
@@ -480,6 +494,21 @@ class RequestRecorder:
                     reasoning_effort=reasoning_effort,
                 )
                 output_tokens = self._tokenizer.tokenize_text(output_prompt)
+            elif self._tokenizer.info.effective_preset == "vllm":
+                original_messages = request_record.get("messages")
+                if isinstance(original_messages, list):
+                    output_messages = copy.deepcopy(original_messages)
+                    output_messages.append(assistant_message)
+                output_body = {
+                    "model": request_record.get("model"),
+                    "messages": output_messages,
+                }
+                original_body = request_record.get("_request_body_for_tokenizer")
+                if isinstance(original_body, dict):
+                    for key in ("chat_template_kwargs", "tools", "tool_choice"):
+                        if key in original_body:
+                            output_body[key] = original_body[key]
+                output_tokens = self._tokenizer.tokenize_request_body(output_body)
             else:
                 output_tokens = self._tokenizer.tokenize_messages(
                     output_messages,
