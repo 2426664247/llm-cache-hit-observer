@@ -5,3 +5,7 @@ __pycache__/
 
 traces/*.jsonl
 !traces/.gitkeep
+
+tokenizers/
+TOKENIZER_VALIDATION*.md
+*.log

@@ -2,6 +2,9 @@ import json
 from typing import Any, Dict, Optional, Tuple
 
 
+CACHE_ESTIMATION_DIFF_THRESHOLD_TOKENS = 1280
+
+
 def _as_int(value: Any) -> Optional[int]:
     if isinstance(value, bool):
         return None
@@ -30,6 +33,7 @@ def _extract_cached_tokens(usage: Dict[str, Any]) -> Optional[int]:
         usage.get("cached_tokens"),
         usage.get("prompt_cache_hit_tokens"),
         usage.get("cache_hit_tokens"),
+        usage.get("cacheRead"),
         usage.get("input_cached_tokens"),
     ]
     cached_tokens = _pick_first_int(direct_candidates)
@@ -38,7 +42,21 @@ def _extract_cached_tokens(usage: Dict[str, Any]) -> Optional[int]:
 
     details = usage.get("prompt_tokens_details")
     if isinstance(details, dict):
-        return _as_int(details.get("cached_tokens"))
+        cached_candidates = [
+            details.get("cached_tokens"),
+            details.get("cacheRead"),
+        ]
+        cache_write_tokens = _pick_first_int(
+            [
+                details.get("cache_write_tokens"),
+                details.get("cacheWrite"),
+            ]
+        ) or 0
+        cached_tokens = _pick_first_int(cached_candidates)
+        if cached_tokens is not None:
+            if cache_write_tokens > 0 and cached_tokens >= cache_write_tokens:
+                return cached_tokens - cache_write_tokens
+            return cached_tokens
     return None
 
 
@@ -125,19 +143,8 @@ def _extract_usage_object(
     return None, None
 
 
-def _judge_estimation_status(
-    difference_tokens: int,
-    denominator_tokens: int,
-) -> str:
-    # Lower-bound policy:
-    # - actual >= estimated is considered normal (conservative estimate).
-    # - only clearly optimistic estimates are flagged as overestimated.
-    tolerance = max(64, int(denominator_tokens * 0.1))
-    if difference_tokens >= 0:
-        return "normal"
-    if abs(difference_tokens) <= tolerance:
-        return "normal"
-    if difference_tokens < 0:
+def _judge_estimation_status(difference_tokens: int) -> str:
+    if difference_tokens < -CACHE_ESTIMATION_DIFF_THRESHOLD_TOKENS:
         return "overestimated"
     return "normal"
 
@@ -159,6 +166,8 @@ def read_actual_usage(
             "actual_input_tokens": None,
             "actual_cached_tokens": None,
             "actual_cache_hit_rate": None,
+            "actual_uncached_tokens": None,
+            "cache_estimation_diff_threshold_tokens": CACHE_ESTIMATION_DIFF_THRESHOLD_TOKENS,
             "difference_tokens": None,
             "status": "actual_cache_unknown",
             "usage_source": usage_source,
@@ -171,6 +180,8 @@ def read_actual_usage(
             "actual_input_tokens": actual_input_tokens,
             "actual_cached_tokens": None,
             "actual_cache_hit_rate": None,
+            "actual_uncached_tokens": None,
+            "cache_estimation_diff_threshold_tokens": CACHE_ESTIMATION_DIFF_THRESHOLD_TOKENS,
             "difference_tokens": None,
             "status": "actual_cache_unknown",
             "usage_source": usage_source,
@@ -187,16 +198,16 @@ def read_actual_usage(
     else:
         actual_cache_hit_rate = None
 
+    actual_uncached_tokens = max(denominator - actual_cached_tokens, 0) if denominator > 0 else None
     difference_tokens = actual_cached_tokens - estimated_cached_tokens
-    if denominator > 0:
-        status = _judge_estimation_status(difference_tokens, denominator)
-    else:
-        status = "normal"
+    status = _judge_estimation_status(difference_tokens)
 
     return {
         "actual_input_tokens": actual_input_tokens,
         "actual_cached_tokens": actual_cached_tokens,
         "actual_cache_hit_rate": actual_cache_hit_rate,
+        "actual_uncached_tokens": actual_uncached_tokens,
+        "cache_estimation_diff_threshold_tokens": CACHE_ESTIMATION_DIFF_THRESHOLD_TOKENS,
         "difference_tokens": difference_tokens,
         "status": status,
         "usage_source": usage_source,

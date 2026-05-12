@@ -1,20 +1,26 @@
 import copy
+import hashlib
 import json
 import time
 from pathlib import Path
 from threading import Lock
+from statistics import median
 from typing import Any, Dict, List, Optional
 
 try:
-    from deepseek_encoding import encode_messages
+    from tokenizer_adapters import TokenizerAdapter, create_tokenizer_adapter
 except Exception:  # pragma: no cover - package execution path
-    from .deepseek_encoding import encode_messages  # type: ignore
+    from .tokenizer_adapters import TokenizerAdapter, create_tokenizer_adapter  # type: ignore
 
 
 def _stable_to_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def _snap_down(token_count: int, block_size: int) -> int:
@@ -53,6 +59,34 @@ def _extract_thinking_mode(request_body: Dict[str, Any]) -> str:
     if "reasoner" in model:
         return "thinking"
     return "chat"
+
+
+def _extract_reasoning_effort(request_body: Dict[str, Any]) -> Optional[str]:
+    value = request_body.get("reasoning_effort")
+    if not isinstance(value, str):
+        return None
+
+    normalized = value.strip().lower()
+    if normalized in {"high", "max"}:
+        return normalized
+    return None
+
+
+def _extract_text_from_content_blocks(content: Any) -> Optional[str]:
+    if not isinstance(content, list):
+        return None
+
+    text_parts: List[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if str(block.get("type", "")).strip().lower() != "text":
+            continue
+        text_parts.append(str(block.get("text", "")))
+
+    if not text_parts:
+        return None
+    return "\n\n".join(text_parts)
 
 
 def _normalize_messages_for_v4(messages: Any) -> List[Dict[str, Any]]:
@@ -97,6 +131,47 @@ def _normalize_messages_for_v4(messages: Any) -> List[Dict[str, Any]]:
     return normalized
 
 
+def _normalize_messages_for_piai_probe(
+    messages: Any,
+    top_level_tools: Any,
+) -> List[Dict[str, Any]]:
+    if not isinstance(messages, list):
+        normalized = _normalize_messages_for_v4(messages)
+    else:
+        rewritten_messages: List[Any] = []
+        for item in messages:
+            if not isinstance(item, dict):
+                rewritten_messages.append(item)
+                continue
+
+            item_copy = copy.deepcopy(item)
+            extracted_text = _extract_text_from_content_blocks(item_copy.get("content"))
+            if extracted_text is not None:
+                item_copy["content"] = extracted_text
+            rewritten_messages.append(item_copy)
+        normalized = _normalize_messages_for_v4(rewritten_messages)
+
+    if not isinstance(top_level_tools, list) or not top_level_tools:
+        return normalized
+
+    tools_copy = copy.deepcopy(top_level_tools)
+    for msg in normalized:
+        role = str(msg.get("role", "")).strip().lower()
+        if role in {"system", "developer"}:
+            msg["tools"] = tools_copy
+            return normalized
+
+    normalized.insert(
+        0,
+        {
+            "role": "system",
+            "content": "",
+            "tools": tools_copy,
+        },
+    )
+    return normalized
+
+
 def _extract_assistant_message_from_response(response_json: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(response_json, dict):
         return None
@@ -133,43 +208,40 @@ def _extract_assistant_message_from_response(response_json: Any) -> Optional[Dic
     return None
 
 
-class DeepSeekTokenizer:
-    def __init__(self, tokenizer_dir: str) -> None:
-        try:
-            from tokenizers import Tokenizer  # type: ignore
-        except Exception as exc:
-            raise RuntimeError(
-                "DeepSeek tokenizer requires 'tokenizers'. "
-                "Please install dependencies from requirements.txt."
-            ) from exc
-
-        tokenizer_path = Path(tokenizer_dir) / "tokenizer.json"
-        if not tokenizer_path.exists():
-            raise RuntimeError(f"tokenizer.json not found: {tokenizer_path}")
-        self.tokenizer = Tokenizer.from_file(str(tokenizer_path))
-
-    def tokenize_text(self, text: str) -> List[int]:
-        encoded = self.tokenizer.encode(text)
-        return [int(t) for t in encoded.ids]
-
-
 class RequestRecorder:
     def __init__(
         self,
         traces_dir: str,
         tokenizer_dir: str,
+        tokenizer_preset: str = "deepseek-v4-pro",
+        hf_local_files_only: bool = True,
         block_size: int = 64,
         cache_idle_ttl_hours: float = 24.0,
-        max_history_requests: int = 2000,
+        max_history_requests: int = 0,
+        tokenizer_adapter: Optional[TokenizerAdapter] = None,
+        vllm_tokenize_url: Optional[str] = None,
+        vllm_tokenizer_model: Optional[str] = None,
+        vllm_tokenize_timeout: float = 120.0,
     ) -> None:
         self.traces_dir = Path(traces_dir)
         self.traces_dir.mkdir(parents=True, exist_ok=True)
-        self._tokenizer = DeepSeekTokenizer(tokenizer_dir)
+        self._tokenizer = tokenizer_adapter or create_tokenizer_adapter(
+            preset=tokenizer_preset,
+            tokenizer_dir=tokenizer_dir,
+            hf_local_files_only=hf_local_files_only,
+            vllm_tokenize_url=vllm_tokenize_url,
+            vllm_tokenizer_model=vllm_tokenizer_model,
+            vllm_tokenize_timeout=vllm_tokenize_timeout,
+        )
         self._history: List[Dict[str, Any]] = []
         self._lock = Lock()
         self._block_size = max(int(block_size), 1)
         self._cache_idle_ttl_seconds = max(float(cache_idle_ttl_hours), 0.0) * 3600.0
-        self._max_history_requests = max(int(max_history_requests), 1)
+        try:
+            self._max_history_requests = int(max_history_requests)
+        except Exception:
+            self._max_history_requests = 0
+        self._openclaw_global_floor_by_model = self._load_openclaw_global_floor_by_model()
 
     def _now_epoch(self) -> float:
         return time.time()
@@ -190,15 +262,73 @@ class RequestRecorder:
                     kept.append(item)
             self._history = kept
 
-        if len(self._history) > self._max_history_requests:
+        if self._max_history_requests > 0 and len(self._history) > self._max_history_requests:
             # Keep newest items only when hitting memory cap.
             self._history = self._history[-self._max_history_requests :]
 
-    def _encode_prompt(self, messages: List[Dict[str, Any]], thinking_mode: str) -> str:
+    def _encode_prompt(
+        self,
+        messages: List[Dict[str, Any]],
+        thinking_mode: str,
+        reasoning_effort: Optional[str] = None,
+    ) -> str:
         try:
-            return encode_messages(messages, thinking_mode=thinking_mode)
+            from deepseek_encoding import encode_messages
+        except Exception:  # pragma: no cover - package execution path
+            from .deepseek_encoding import encode_messages  # type: ignore
+
+        try:
+            return encode_messages(
+                messages,
+                thinking_mode=thinking_mode,
+                reasoning_effort=reasoning_effort,
+            )
         except Exception:
             return canonicalize_messages(messages)
+
+    def _prompt_encoding_source(self) -> str:
+        if self._tokenizer.info.effective_preset == "vllm":
+            return "vllm_prompt_encoding"
+        return "deepseek_prompt_encoding"
+
+    def _load_openclaw_global_floor_by_model(self) -> Dict[str, int]:
+        # OpenClaw-only seed floor from historical traces, so first turn can
+        # approximate warm-cache behavior across sessions.
+        model_samples: Dict[str, List[int]] = {}
+        for path in self.traces_dir.glob("*.jsonl"):
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except Exception:
+                            continue
+                        if row.get("conversation_mode") != "openclaw_agent":
+                            continue
+                        if row.get("input_token_source") != "openclaw_raw_body":
+                            continue
+                        model = row.get("model")
+                        if not isinstance(model, str) or not model:
+                            continue
+                        cached = row.get("actual_cached_tokens")
+                        if not isinstance(cached, int) or cached <= 0:
+                            continue
+                        model_samples.setdefault(model, []).append(cached)
+            except Exception:
+                continue
+
+        floors: Dict[str, int] = {}
+        for model, samples in model_samples.items():
+            if not samples:
+                continue
+            m = int(median(samples))
+            m = _snap_down(m, self._block_size)
+            if m > 0:
+                floors[model] = m
+        return floors
 
     def create_request_record(
         self,
@@ -206,15 +336,55 @@ class RequestRecorder:
         request_id: str,
         timestamp: str,
         request_body: Any,
+        request_body_bytes: Optional[bytes] = None,
+        conversation_mode: str = "simple_streaming",
     ) -> Dict[str, Any]:
         body = request_body if isinstance(request_body, dict) else {}
         messages = body.get("messages", [])
         canonical_text = canonicalize_messages(messages)
 
         thinking_mode = _extract_thinking_mode(body)
-        messages_for_encoding = _normalize_messages_for_v4(messages)
-        prompt_text = self._encode_prompt(messages_for_encoding, thinking_mode=thinking_mode)
-        token_ids = self._tokenizer.tokenize_text(prompt_text)
+        reasoning_effort: Optional[str] = None
+        if conversation_mode == "piai_probe":
+            messages_for_encoding = _normalize_messages_for_piai_probe(
+                messages=messages,
+                top_level_tools=body.get("tools"),
+            )
+            reasoning_effort = _extract_reasoning_effort(body)
+        else:
+            messages_for_encoding = _normalize_messages_for_v4(messages)
+
+        if self._tokenizer.info.effective_preset == "deepseek-v4-pro":
+            prompt_text = self._encode_prompt(
+                messages_for_encoding,
+                thinking_mode=thinking_mode,
+                reasoning_effort=reasoning_effort,
+            )
+            token_ids = self._tokenizer.tokenize_text(prompt_text)
+        elif self._tokenizer.info.effective_preset == "vllm":
+            token_ids = self._tokenizer.tokenize_request_body(body)
+        else:
+            token_ids = self._tokenizer.tokenize_messages(
+                messages_for_encoding,
+                thinking_mode=thinking_mode,
+                reasoning_effort=reasoning_effort,
+            )
+        raw_body_sha256: Optional[str] = None
+        raw_body_size_bytes = 0
+        raw_body_token_count: Optional[int] = None
+        raw_body_token_ids: List[int] = []
+        if isinstance(request_body_bytes, (bytes, bytearray)):
+            raw_bytes = bytes(request_body_bytes)
+            raw_body_size_bytes = len(raw_bytes)
+            raw_body_sha256 = _sha256_hex(raw_bytes)
+            try:
+                raw_body_text = raw_bytes.decode("utf-8", errors="replace")
+                raw_body_token_ids = self._tokenizer.tokenize_text(raw_body_text)
+                raw_body_token_count = len(raw_body_token_ids)
+            except Exception:
+                raw_body_token_count = None
+                raw_body_token_ids = []
+
         snapped_prefix_len = _snap_down(len(token_ids), self._block_size)
         # Request boundary unit: the aligned input prefix is persisted for future matching.
         request_prefix_tokens = token_ids[:snapped_prefix_len] if snapped_prefix_len > 0 else []
@@ -229,17 +399,74 @@ class RequestRecorder:
             "canonical_text": canonical_text,
             "token_ids": token_ids,
             "local_input_tokens": len(token_ids),
+            "raw_request_body_sha256": raw_body_sha256,
+            "raw_request_body_size_bytes": raw_body_size_bytes,
+            "raw_request_body_tokenizer_tokens": raw_body_token_count,
+            "raw_request_body_token_ids": raw_body_token_ids,
             "persisted_prefix_units_tokens": units,
             "cache_block_size": self._block_size,
+            "cache_estimation_input_tokens": len(token_ids),
+            "_openclaw_global_floor_tokens": self._openclaw_global_floor_by_model.get(
+                str(body.get("model", "")),
+                0,
+            ),
+            "_cache_unit_source": self._prompt_encoding_source(),
+            "_cache_unit_fallback_reason": None,
+            "tokenizer_preset": self._tokenizer.info.preset,
+            "tokenizer_effective_preset": self._tokenizer.info.effective_preset,
+            "tokenizer_runtime": self._tokenizer.info.runtime,
+            "tokenizer_dir": self._tokenizer.info.tokenizer_dir,
+            "tokenizer_warning": self._tokenizer.info.warning,
             "_thinking_mode": thinking_mode,
+            "_reasoning_effort": reasoning_effort,
             "_messages_for_encoding": messages_for_encoding,
+            "_request_body_for_tokenizer": copy.deepcopy(body),
         }
+
+    def apply_input_token_source(
+        self,
+        request_record: Dict[str, Any],
+        input_token_source: str,
+    ) -> Dict[str, Any]:
+        if input_token_source != "openclaw_raw_body":
+            request_record["_cache_unit_source"] = self._prompt_encoding_source()
+            request_record["_cache_unit_fallback_reason"] = None
+            return request_record
+
+        raw_ids = request_record.get("raw_request_body_token_ids")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            request_record["_cache_unit_source"] = "deepseek_prompt_encoding"
+            request_record["_cache_unit_fallback_reason"] = "raw_request_body_unavailable"
+            return request_record
+
+        block_size = request_record.get("cache_block_size", self._block_size)
+        try:
+            block_size_i = max(int(block_size), 1)
+        except Exception:
+            block_size_i = self._block_size
+
+        snapped_prefix_len = _snap_down(len(raw_ids), block_size_i)
+        request_prefix_tokens = raw_ids[:snapped_prefix_len] if snapped_prefix_len > 0 else []
+
+        # Switch cache-estimation basis to raw request body token stream.
+        request_record["token_ids"] = raw_ids
+        request_record["persisted_prefix_units_tokens"] = (
+            [request_prefix_tokens] if request_prefix_tokens else []
+        )
+        request_record["cache_estimation_input_tokens"] = len(raw_ids)
+        request_record["_cache_unit_source"] = "raw_request_body"
+        request_record["_cache_unit_fallback_reason"] = None
+        return request_record
 
     def attach_response_cache_units(
         self,
         request_record: Dict[str, Any],
         response_json: Any,
     ) -> Dict[str, Any]:
+        if request_record.get("_cache_unit_source") == "raw_request_body":
+            # Keep unit space consistent: raw-body mode only persists request-boundary units.
+            return request_record
+
         # DeepSeek conservative baseline:
         # keep request boundary + output boundary, but do not add shared-prefix / interval units.
         units = request_record.get("persisted_prefix_units_tokens")
@@ -251,14 +478,44 @@ class RequestRecorder:
         assistant_message = _extract_assistant_message_from_response(response_json)
         if assistant_message:
             thinking_mode = str(request_record.get("_thinking_mode", "chat"))
+            reasoning_effort = request_record.get("_reasoning_effort")
+            if not isinstance(reasoning_effort, str):
+                reasoning_effort = None
             base_messages = request_record.get("_messages_for_encoding")
             if not isinstance(base_messages, list):
                 base_messages = _normalize_messages_for_v4(request_record.get("messages", []))
 
             output_messages = copy.deepcopy(base_messages)
             output_messages.append(assistant_message)
-            output_prompt = self._encode_prompt(output_messages, thinking_mode=thinking_mode)
-            output_tokens = self._tokenizer.tokenize_text(output_prompt)
+            if self._tokenizer.info.effective_preset == "deepseek-v4-pro":
+                output_prompt = self._encode_prompt(
+                    output_messages,
+                    thinking_mode=thinking_mode,
+                    reasoning_effort=reasoning_effort,
+                )
+                output_tokens = self._tokenizer.tokenize_text(output_prompt)
+            elif self._tokenizer.info.effective_preset == "vllm":
+                original_messages = request_record.get("messages")
+                if isinstance(original_messages, list):
+                    output_messages = copy.deepcopy(original_messages)
+                    output_messages.append(assistant_message)
+                output_body = {
+                    "model": request_record.get("model"),
+                    "messages": output_messages,
+                }
+                original_body = request_record.get("_request_body_for_tokenizer")
+                if isinstance(original_body, dict):
+                    for key in ("chat_template_kwargs", "tools", "tool_choice"):
+                        if key in original_body:
+                            output_body[key] = original_body[key]
+                output_tokens = self._tokenizer.tokenize_request_body(output_body)
+            else:
+                output_tokens = self._tokenizer.tokenize_messages(
+                    output_messages,
+                    thinking_mode=thinking_mode,
+                    reasoning_effort=reasoning_effort,
+                    add_generation_prompt=False,
+                )
             snapped_len = _snap_down(len(output_tokens), self._block_size)
             if snapped_len > 0:
                 # Output boundary unit: include assistant turn, then align and persist.
