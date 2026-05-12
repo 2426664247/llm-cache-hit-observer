@@ -38,8 +38,16 @@ HOP_BY_HOP_HEADERS = {
 }
 
 
+APP_VERSION = "0.2.0"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Local prompt-cache hit proxy")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"cache-hit-proxy {APP_VERSION}",
+    )
     parser.add_argument("--port", type=int, default=8787, help="Local proxy port")
     parser.add_argument(
         "--target-base-url",
@@ -439,7 +447,7 @@ def create_app(
     vllm_tokenizer_model: str | None = None,
     vllm_tokenize_timeout: float = 120.0,
 ) -> FastAPI:
-    app = FastAPI(title="Cache Hit Proxy", version="0.2.0")
+    app = FastAPI(title="Cache Hit Proxy", version=APP_VERSION)
     traces_dir = Path(__file__).resolve().parent / "traces"
     chat_url = resolve_target_chat_url(target_base_url, target_chat_url)
     resolved_vllm_metrics_url = resolve_vllm_metrics_url(
